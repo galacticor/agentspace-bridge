@@ -49,7 +49,7 @@ This workspace bridges **Google Antigravity** with **IOH Agentspace** so that:
    - `agentspace_export_slides(session_tag="<8_char_id>", formats=["pptx", "pdf"])`: Export a Canvas/Slides presentation directly to native `.pptx` (via `widgetExportImmersiveArtifact` RPC) and/or `.pdf` (via headless Web UI Export) at zero AGY token cost.
    - `agentspace_delete_session(session_id=...)`: Delete a specific chat session when explicitly requested.
    - `agentspace_list_sessions(limit=20)`: List recent chat sessions.
-   - `agentspace_refresh_token(browser="msedge")`: Pop up a browser window to automatically refresh and save `./agentspace_xsrf.json` inside the project folder.
+   - `agentspace_refresh_token(browser=...)`: Refresh and save `./agentspace_xsrf.json` inside the project folder (defaults to `"chrome"` on macOS and `"msedge"` on Windows; tries a silent headless refresh first if `.auth_profile/` already exists, and falls back to an interactive popup window when login/2FA is needed).
 
 2. **Via Direct CLI (`agentspace_cli.py`):**
    - Fast coding/reasoning query (kept & prefixed with `[agy-bridge]`):

@@ -16,18 +16,23 @@ cd agentspace-bridge
 ```
 
 ### 2. Register the MCP Server in Antigravity
-Run the setup script once to automatically add `ioh-agentspace` to `~/.gemini/config/mcp_config.json`:
-```powershell
+Run the setup script once to automatically add `ioh-agentspace` to `~/.gemini/config/mcp_config.json` (works on both Windows and macOS):
+```bash
+# macOS / Linux
+/opt/homebrew/bin/python3 setup_mcp.py
+
+# Windows
 python setup_mcp.py
 ```
 
-### 3. Automatic Browser Pop-Up Token Refresh (`./agentspace_xsrf.json`)
+### 3. Automatic Browser Token Refresh (`./agentspace_xsrf.json`)
 Because IOH Agentspace uses Workforce Identity Federation (BYOID), requests are authenticated using a short-lived HS256 JWT signed by your browser session's `getoxsrf` key (~1 hour validity).
 
-- **Automatic Pop-Up Refresh:** Whenever `./agentspace_xsrf.json` is missing or expires (`HTTP 401`), `agentspace_cli.py` and the MCP server **automatically pop open a browser window** (`https://agentspace.ioh.co.id`) using a persistent local profile (`.auth_profile/`), grab a fresh `getoxsrf` token + `csesidx` as soon as SSO completes, save it directly to `./agentspace_xsrf.json` inside the project folder, and close the browser window.
+- **Isolated Work Profile (`.auth_profile/`):** `agentspace_cli.py` uses an isolated browser profile folder (`./.auth_profile/`) separate from your personal browser profile. On macOS it defaults to **Google Chrome (`chrome`)**; on Windows it defaults to **Microsoft Edge (`msedge`)** (with automatic fallback across both).
+- **Silent Headless Refresh + Interactive Fallback:** Whenever `./agentspace_xsrf.json` is missing or expires (`HTTP 401`), `agentspace_cli.py` and the MCP server first try a **15-second silent headless refresh** in the background if `.auth_profile/` is already logged in (0 screen interruption). If first-time login or 2FA is needed, it automatically opens a visible browser window (`https://agentspace.ioh.co.id`), grabs `/auth/getoxsrf` + `csesidx`, saves `./agentspace_xsrf.json`, and closes the window.
 - **Manual Trigger:** You can also trigger a token refresh at any time via:
-  ```powershell
-  python agentspace_cli.py --refresh-token
+  ```bash
+  python3 agentspace_cli.py --refresh-token
   ```
 
 ---

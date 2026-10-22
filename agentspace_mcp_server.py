@@ -4,6 +4,8 @@ Zero-dependency stdio MCP Server for IOH Agentspace (Gemini Enterprise - gemini-
 Allows Google Antigravity to offload queries, code generation, Netra/ACE agent queries, and enterprise search
 (Confluence/Jira/SharePoint) to IOH Agentspace (`agentspace.ioh.co.id`), as well as list and delete chat sessions.
 """
+from __future__ import annotations
+
 import json
 import sys
 from agentspace_cli import (
@@ -12,6 +14,7 @@ from agentspace_cli import (
     export_session_artifacts,
     list_sessions,
     refresh_xsrf_token,
+    DEFAULT_BROWSER_CHANNEL,
     DEFAULT_MODEL,
     DEFAULT_THINKING,
     DEFAULT_CSESIDX,
@@ -188,8 +191,8 @@ TOOLS = [
             "properties": {
                 "browser": {
                     "type": "string",
-                    "default": "msedge",
-                    "description": "Browser channel to open ('msedge' or 'chrome').",
+                    "default": DEFAULT_BROWSER_CHANNEL,
+                    "description": f"Browser channel to open ('chrome' or 'msedge'; default on this OS: '{DEFAULT_BROWSER_CHANNEL}').",
                 },
             },
         },
@@ -328,7 +331,7 @@ def handle_request(msg: dict) -> dict | None:
 
             elif name == "agentspace_refresh_token":
                 data, saved_path = refresh_xsrf_token(
-                    browser_channel=args.get("browser", "msedge"),
+                    browser_channel=args.get("browser", DEFAULT_BROWSER_CHANNEL),
                 )
                 return {
                     "jsonrpc": "2.0",

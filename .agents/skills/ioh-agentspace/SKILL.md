@@ -1,16 +1,40 @@
 ---
 name: ioh-agentspace
 description: >-
-  Offload coding tasks, analysis, reasoning, specialized agent queries (Netra Agent,
-  ACE Platform, Slides Agent), or enterprise knowledge base searches (IOH Confluence,
-  SharePoint, Jira, OneDrive, ServiceNow) to IOH's Gemini Enterprise (Agentspace)
-  running Gemini 4 Argon (gemini-4-argon), and manage/delete chat sessions.
+  Offload deep thinking, multi-file architecture, complex debugging, >100-line code/SQL
+  generation, analytical reasoning, specialized agent queries (Netra Agent, ACE Platform,
+  Slides Agent), or enterprise knowledge base searches (IOH Confluence, SharePoint, Jira,
+  OneDrive, ServiceNow) to IOH's Gemini Enterprise (Agentspace) running Gemini 4 Argon
+  (gemini-4-argon). MANDATORY when running on Gemini 3.7 Flash as an Orchestrator to
+  save Antigravity quota without sacrificing reasoning quality.
 ---
 
 # IOH Agentspace (`gemini-4-argon` & Netra Agent) Skill
 
 ## Overview
-This skill connects Antigravity to IOH's Gemini Enterprise (Agentspace) via `agentspace_cli.py` and the `ioh-agentspace` MCP server.
+This skill connects Antigravity to IOH's Gemini Enterprise (Agentspace) via `/Users/widyantohd/Documents/Projects/agentspace-bridge/agentspace_cli.py` (or `agentspace_cli.py` in the bridge workspace) and the `ioh-agentspace` MCP server (`agentspace_ask`, `agentspace_export_slides`, `agentspace_list_sessions`, `agentspace_delete_session`, `agentspace_refresh_token`).
+
+---
+
+## Flash-as-Orchestrator Protocol (Mandatory 4-Step Playbook When Running on Gemini 3.7 Flash)
+
+Whenever the Antigravity main agent is running on **Gemini 3.7 Flash (Medium/High)** (or whenever offloading complex work to save AGY quota), **DO NOT attempt to solve complex architecture, tricky bugs, or large code/SQL generation using local Flash weights alone.** Act strictly as a high-speed **Orchestrator** for `gemini-4-argon`:
+
+1. **Step 1 — Local Dependency Recon (Never Send Blind Prompts):**
+   - Before calling `agentspace_ask` or `agentspace_cli.py` on a repo task, run fast local searches (`grep_search`, `find_by_name`, or `read_file` on headers/imports) to identify **all coupled files**.
+   - Pass those files directly from disk via `input_files` (`-f fileA.py fileB.py`) so `gemini-4-argon` sees the real source code without bloating AGY's token window.
+2. **Step 2 — Prompt `gemini-4-argon` (`HIGH`) for "Drop-In" Outputs:**
+   - Do **not** ask Agentspace for vague advice that Flash has to translate into code.
+   - Instruct `gemini-4-argon` (`thinking_level="HIGH"`, `output_file="<name>"`, `summary_only=True`) to return either:
+     - **Complete standalone scripts/queries** saved directly to `./outputs/chat_<tag>/`, OR
+     - **Exact surgical edit specifications** (`File Path`, `Exact Target Block`, `Exact Replacement Block`) that you can apply mechanically with `edit_file`.
+   - **CRITICAL Anti-Polling Rule for Flash:** When running `agentspace_cli.py` via `run_command` (especially with `--thinking HIGH`, which takes 60–180s), if the command backgrounds after `WaitMsBeforeAsync`, **NEVER poll `manage_task` or set `schedule` timers**. Simply end your turn with zero tool calls; Antigravity's reactive wakeup will automatically resume you the instant `agentspace_cli.py` finishes. (Or call the synchronous `agentspace_ask` MCP tool.)
+3. **Step 3 — Zero-Guesswork Error Loop (Multi-Turn Continuity):**
+   - After applying `gemini-4-argon`'s changes, immediately verify locally via `run_command` (unit tests, syntax check, or dry run).
+   - If an error or edge case appears, **DO NOT guess or improvise a fix on Flash**. Send the exact stderr traceback back to the **same** `session_tag` thread (`agentspace_ask` reuses the existing session automatically on Turn 2+ without re-uploading `-f` files) and let `gemini-4-argon` diagnose the root cause.
+4. **Step 4 — Subagent Model Rules (`Model: "flash"` vs `Model: "inherit"`):**
+   - **NEVER use Flash Low (`flash_lite`).** (Also note: `Model: "pro"` is not mapped in `TieredModelConfig`; use `Model: "inherit"` or `Model: "flash"` with `[EFFORT: HIGH]` / `[EFFORT: MEDIUM]`).
+   - When the main agent is running on **Gemini 3.7 Flash** and needs a complex script (e.g., an 800-line `pptxgenjs` deck builder in Stage 2 of the `.pptx` pipeline), have `gemini-4-argon` in Agentspace generate the complete `build_deck.js` script or exhaustive spec first (`-o ... --summary-only`), and use the `Model: "flash"` (`[EFFORT: HIGH]` / `[EFFORT: MEDIUM]`) subagent to execute the build and run M365 Visual QA (`office_view_hook.py`).
 
 ## How to Execute Queries
 
@@ -65,7 +89,7 @@ Other built-in aliases: `ace` (`8461818071814491910`), `slides` / `pptx` (`17216
      - Instruct the subagent to:
        1. Read `executive-slides`, `minimal-slides`, and `pptx` (`SKILL.md`), and run `select_palette.py` on the outline file.
        2. Build the deck via `pptxgenjs` with **true native editable Office charts (`pres.charts.BAR`/`LINE`)**, **Tufte tables** (top/bottom rules only, zero vertical gridlines, single-line rows), and **single-line Cambria Action Titles**.
-       3. Run closed-loop M365 Visual QA (`python "C:\Users\<employee_id>\.gemini\config\office_view_hook.py" "<pptx_path>" --pages "..." --render --no-media`), inspect the rendered `.png` slides via `read_file`, fix any text wrapping or table overflow, and return only a concise summary + final `.pptx` path to the main agent.
+       3. Run closed-loop M365 Visual QA (`office_view_hook.py "<pptx_path>" --pages "..." --summary-only --render` — via `/opt/homebrew/bin/python3 "$HOME/.gemini/config/office_view_hook.py"` on macOS or `python "%USERPROFILE%\.gemini\config\office_view_hook.py"` on Windows), inspect the rendered `.png` slides via `read_file`, fix any text wrapping or table overflow, and return only a concise summary + final `.pptx` path to the main agent.
   3. **Optional Fallback (`--agent slides` / `--export-slides`):**
      - Only use `python "agentspace_cli.py" --agent slides` or `--export-slides` if the user explicitly asks to export an Agentspace Canvas/Slides artifact from the Web UI.
 

@@ -4,6 +4,8 @@ IOH Agentspace (Gemini Enterprise) CLI & Helper for Google Antigravity.
 Connects directly to https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetStreamAssist
 using the local Workforce Identity BYOID session key (~/Downloads/json.txt or %TEMP%/agentspace_xsrf.json).
 """
+from __future__ import annotations
+
 import argparse
 import base64
 import glob
@@ -12,6 +14,7 @@ import hmac
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -28,6 +31,10 @@ WIDGET_CONFIG_ID = os.environ.get("AGENTSPACE_CONFIG_ID", "384c42b0-2885-415a-82
 DEFAULT_CSESIDX = os.environ.get("AGENTSPACE_CSESIDX", "")
 DEFAULT_MODEL = os.environ.get("AGENTSPACE_MODEL", "gemini-4-argon")
 DEFAULT_THINKING = os.environ.get("AGENTSPACE_THINKING", "MEDIUM")
+DEFAULT_BROWSER_CHANNEL = os.environ.get(
+    "AGENTSPACE_BROWSER",
+    "chrome" if sys.platform == "darwin" else "msedge",
+)
 HOST = "biz-discoveryengine.googleapis.com"
 ORIGIN = "https://vertexaisearch.cloud.google"
 
@@ -124,98 +131,208 @@ def _parse_xsrf_payload(raw_text: str) -> dict | None:
     return None
 
 
-def refresh_xsrf_token(
-    csesidx: str | None = None,
-    browser_channel: str = "msedge",
-    timeout_sec: int = 180,
-) -> tuple[dict, str]:
+def _find_playwright_python() -> str | None:
     """
-    Launches an interactive browser window (using a persistent profile in .auth_profile)
-    pointing to https://agentspace.ioh.co.id, waits for SSO / Agentspace load, fetches
-    /auth/getoxsrf, and saves the refreshed token to ./agentspace_xsrf.json.
+    On macOS/Linux/Windows, if the current Python interpreter lacks `playwright`
+    (e.g. Apple's /usr/bin/python3 vs Homebrew's /opt/homebrew/bin/python3),
+    locates an installed Python interpreter that has `playwright`.
     """
-    from playwright.sync_api import sync_playwright
+    candidates = []
+    if sys.platform == "darwin":
+        candidates.extend(["/opt/homebrew/bin/python3", "/usr/local/bin/python3"])
+    elif sys.platform != "win32":
+        candidates.extend(["/usr/local/bin/python3", "/usr/bin/python3"])
 
+    for cand in candidates:
+        if os.path.isfile(cand) and os.path.realpath(cand) != os.path.realpath(sys.executable):
+            try:
+                res = subprocess.run(
+                    [cand, "-c", "import playwright"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                if res.returncode == 0:
+                    return cand
+            except Exception:
+                continue
+    return None
+
+
+def _get_browser_channel_candidates(preferred: str | None = None) -> list[str | None]:
+    """
+    Returns ordered browser channels to try on the current OS so that both
+    Windows (msedge -> chrome -> chromium) and macOS (chrome -> msedge -> chromium)
+    work seamlessly without breaking each other.
+    """
+    pref = (preferred or DEFAULT_BROWSER_CHANNEL).strip() if (preferred or DEFAULT_BROWSER_CHANNEL) else None
+    if sys.platform == "darwin":
+        base_order: list[str | None] = [pref, "chrome", "msedge", None]
+    else:
+        base_order = [pref, "msedge", "chrome", None]
+    deduped: list[str | None] = []
+    for ch in base_order:
+        if ch not in deduped:
+            deduped.append(ch)
+    return deduped
+
+
+def _launch_persistent_browser(playwright_instance, browser_channel: str | None = None, **kwargs):
+    """
+    Launches a persistent Chromium context trying the preferred browser channel first,
+    then gracefully falling back across Chrome, Edge, and bundled Chromium.
+    Suppresses Playwright automation flags so navigator.webdriver is false.
+    """
     os.makedirs(AUTH_PROFILE_DIR, exist_ok=True)
-    captured: dict = {}
+    last_err = None
+    for ch in _get_browser_channel_candidates(browser_channel):
+        try:
+            launch_kwargs = dict(kwargs)
+            launch_kwargs["user_data_dir"] = AUTH_PROFILE_DIR
+            launch_kwargs.setdefault("args", ["--disable-blink-features=AutomationControlled"])
+            launch_kwargs.setdefault("ignore_default_args", ["--enable-automation"])
+            if ch:
+                launch_kwargs["channel"] = ch
+            ctx = playwright_instance.chromium.launch_persistent_context(**launch_kwargs)
+            return ctx, (ch or "chromium")
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to launch browser (Chrome/Edge/Chromium) via Playwright: {last_err}")
 
+
+def _attempt_xsrf_capture(
+    playwright_instance,
+    csesidx: str | None,
+    browser_channel: str,
+    headless: bool,
+    timeout_sec: int,
+) -> dict:
+    captured: dict = {}
+    context, active_channel = _launch_persistent_browser(
+        playwright_instance,
+        browser_channel=browser_channel,
+        headless=headless,
+        viewport={"width": 1100, "height": 780},
+    )
+    mode_label = "headless background" if headless else "interactive window"
     print(
-        f"[Agentspace Auth] Opening browser ({browser_channel}) to refresh XSRF token -> {PROJECT_XSRF_PATH} ...",
+        f"[Agentspace Auth] Trying {mode_label} ({active_channel}) with profile {AUTH_PROFILE_DIR} ...",
         file=sys.stderr,
     )
 
-    with sync_playwright() as p:
-        context = None
-        for ch in [browser_channel, "msedge", "chrome", None]:
+    def on_response(response):
+        if "/auth/getoxsrf" in response.url and response.status == 200 and not captured:
             try:
-                launch_kwargs = {
-                    "user_data_dir": AUTH_PROFILE_DIR,
-                    "headless": False,
-                    "viewport": {"width": 1100, "height": 780},
-                }
-                if ch:
-                    launch_kwargs["channel"] = ch
-                context = p.chromium.launch_persistent_context(**launch_kwargs)
-                break
+                parsed_url = urllib.parse.urlparse(response.url)
+                qs = urllib.parse.parse_qs(parsed_url.query)
+                resp_cses = qs.get("csesidx", [csesidx or DEFAULT_CSESIDX])[0]
+                data = _parse_xsrf_payload(response.text())
+                if data:
+                    data["csesidx"] = resp_cses
+                    data["savedAt"] = int(time.time())
+                    captured.update(data)
             except Exception:
-                continue
+                pass
 
-        if context is None:
-            raise RuntimeError("Failed to launch browser (Edge/Chrome/Chromium) via Playwright.")
+    context.on("response", on_response)
+    page = context.pages[0] if context.pages else context.new_page()
 
-        def on_response(response):
-            if "/auth/getoxsrf" in response.url and response.status == 200 and not captured:
-                try:
-                    parsed_url = urllib.parse.urlparse(response.url)
-                    qs = urllib.parse.parse_qs(parsed_url.query)
-                    resp_cses = qs.get("csesidx", [csesidx or DEFAULT_CSESIDX])[0]
-                    data = _parse_xsrf_payload(response.text())
-                    if data:
-                        data["csesidx"] = resp_cses
-                        data["savedAt"] = int(time.time())
-                        captured.update(data)
-                except Exception:
-                    pass
+    try:
+        page.goto(AGENTSPACE_ENTRY_URL, wait_until="domcontentloaded", timeout=min(60000, timeout_sec * 1000))
+    except Exception:
+        pass
 
-        context.on("response", on_response)
-        page = context.pages[0] if context.pages else context.new_page()
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline and not captured:
+        for pg in list(context.pages):
+            try:
+                cur_url = pg.url
+                if cur_url.startswith(ORIGIN):
+                    qs = urllib.parse.parse_qs(urllib.parse.urlparse(cur_url).query)
+                    detected_cses = qs.get("csesidx", [None])[0] or csesidx
+                    if detected_cses:
+                        raw_xsrf = pg.evaluate(
+                            """async (u) => {
+                                const r = await fetch(u, {credentials: 'include'});
+                                return await r.text();
+                            }""",
+                            f"{ORIGIN}/auth/getoxsrf?csesidx={detected_cses}",
+                        )
+                        data = _parse_xsrf_payload(raw_xsrf)
+                        if data:
+                            data["csesidx"] = detected_cses
+                            data["savedAt"] = int(time.time())
+                            captured.update(data)
+                            break
+            except Exception:
+                pass
+        if not captured:
+            page.wait_for_timeout(1000)
 
-        try:
-            page.goto(AGENTSPACE_ENTRY_URL, wait_until="domcontentloaded", timeout=60000)
-        except Exception:
-            pass
+    try:
+        context.close()
+    except Exception:
+        pass
 
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline and not captured:
-            for pg in list(context.pages):
-                try:
-                    cur_url = pg.url
-                    if cur_url.startswith(ORIGIN):
-                        qs = urllib.parse.parse_qs(urllib.parse.urlparse(cur_url).query)
-                        detected_cses = qs.get("csesidx", [None])[0] or csesidx
-                        if detected_cses:
-                            raw_xsrf = pg.evaluate(
-                                """async (u) => {
-                                    const r = await fetch(u, {credentials: 'include'});
-                                    return await r.text();
-                                }""",
-                                f"{ORIGIN}/auth/getoxsrf?csesidx={detected_cses}",
-                            )
-                            data = _parse_xsrf_payload(raw_xsrf)
-                            if data:
-                                data["csesidx"] = detected_cses
-                                data["savedAt"] = int(time.time())
-                                captured.update(data)
-                                break
-                except Exception:
-                    pass
-            if not captured:
-                page.wait_for_timeout(1000)
+    return captured
 
-        try:
-            context.close()
-        except Exception:
-            pass
+
+def refresh_xsrf_token(
+    csesidx: str | None = None,
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL,
+    timeout_sec: int = 180,
+    headless_first: bool = True,
+) -> tuple[dict, str]:
+    """
+    Refreshes the IOH Agentspace XSRF token using a persistent Work profile in .auth_profile/.
+    - If .auth_profile/ already has a saved login session and headless_first=True, first attempts
+      a silent 15s headless refresh so no popup window interrupts the user.
+    - If first-time setup or SSO requires interactive login/2FA, opens a visible browser window.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        alt_py = _find_playwright_python()
+        if alt_py:
+            cmd = [
+                alt_py,
+                os.path.abspath(__file__),
+                "--refresh-token",
+                "--browser",
+                browser_channel,
+                "--json",
+            ]
+            if csesidx:
+                cmd.extend(["--csesidx", csesidx])
+            subprocess.run(cmd, check=True)
+            return load_xsrf()
+        raise
+
+    has_existing_profile = os.path.isdir(os.path.join(AUTH_PROFILE_DIR, "Default"))
+    captured: dict = {}
+
+    with sync_playwright() as p:
+        if headless_first and has_existing_profile:
+            try:
+                captured = _attempt_xsrf_capture(
+                    p,
+                    csesidx=csesidx,
+                    browser_channel=browser_channel,
+                    headless=True,
+                    timeout_sec=15,
+                )
+            except Exception:
+                captured = {}
+
+        if not captured:
+            captured = _attempt_xsrf_capture(
+                p,
+                csesidx=csesidx,
+                browser_channel=browser_channel,
+                headless=False,
+                timeout_sec=timeout_sec,
+            )
 
     if not captured:
         raise RuntimeError(
@@ -282,6 +399,52 @@ def make_jwt(xsrf: dict, csesidx: str = DEFAULT_CSESIDX) -> str:
     return f"{h_b64}.{p_b64}.{b64url_encode(sig)}"
 
 
+def _build_browser_rpc_headers(jwt_tok: str) -> dict[str, str]:
+    """
+    Returns authentic browser CORS + Client Hints headers matching the host OS
+    (Chrome on macOS/Linux, Edge on Windows) so RPC requests never send
+    Python's default 'User-Agent: Python-urllib/3.x' header.
+    """
+    if sys.platform == "darwin":
+        user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+        sec_ch_ua = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+        sec_ch_platform = '"macOS"'
+    elif sys.platform == "win32":
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+        )
+        sec_ch_ua = '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+        sec_ch_platform = '"Windows"'
+    else:
+        user_agent = (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+        sec_ch_ua = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+        sec_ch_platform = '"Linux"'
+
+    return {
+        "Authorization": f"Bearer {jwt_tok}",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": user_agent,
+        "Sec-Ch-Ua": sec_ch_ua,
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": sec_ch_platform,
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "X-Goog-Api-Client": "gemini-enterprise-classic/1.0.0",
+        "Origin": ORIGIN,
+        "Referer": f"{ORIGIN}/",
+    }
+
+
 def _post_widget_rpc(
     endpoint: str,
     payload: dict,
@@ -303,13 +466,7 @@ def _post_widget_rpc(
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {jwt_tok}",
-                "Content-Type": "application/json",
-                "X-Goog-Api-Client": "gemini-enterprise-classic/1.0.0",
-                "Origin": ORIGIN,
-                "Referer": f"{ORIGIN}/",
-            },
+            headers=_build_browser_rpc_headers(jwt_tok),
             method="POST",
         )
         try:
@@ -641,7 +798,7 @@ def _export_pdf_via_webui(
     short_sess: str,
     save_pdf_path: str,
     csesidx: str = DEFAULT_CSESIDX,
-    browser_channel: str = "msedge",
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL,
 ) -> str:
     """
     Uses headless Playwright with `.auth_profile` to open the session's Canvas artifact
@@ -658,9 +815,9 @@ def _export_pdf_via_webui(
 
     url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/session/{short_sess}?csesidx={effective_csesidx}"
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            AUTH_PROFILE_DIR,
-            channel=browser_channel,
+        ctx, _ = _launch_persistent_browser(
+            p,
+            browser_channel=browser_channel,
             headless=True,
             accept_downloads=True,
             viewport={"width": 1600, "height": 900},
@@ -1046,8 +1203,8 @@ def main():
     )
     parser.add_argument(
         "--browser",
-        default="msedge",
-        help="Browser channel for --refresh-token (default: msedge, or chrome)",
+        default=DEFAULT_BROWSER_CHANNEL,
+        help=f"Browser channel for --refresh-token (default on this OS: {DEFAULT_BROWSER_CHANNEL}; supports chrome or msedge)",
     )
     parser.add_argument("--limit", type=int, default=20, help="Number of sessions to list with --list-sessions")
     parser.add_argument("--csesidx", default=DEFAULT_CSESIDX, help="Browser session index (csesidx) from URL")

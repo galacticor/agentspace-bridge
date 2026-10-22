@@ -1,0 +1,7 @@
+# Never commit session tokens or XSRF keys
+agentspace_xsrf.json
+json*.txt
+getoxsrf*
+.env
+__pycache__/
+*.pyc

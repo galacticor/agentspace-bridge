@@ -9,6 +9,7 @@ import sys
 from agentspace_cli import (
     ask_agentspace,
     delete_session,
+    export_session_artifacts,
     list_sessions,
     refresh_xsrf_token,
     DEFAULT_MODEL,
@@ -60,10 +61,15 @@ TOOLS = [
                     "type": "string",
                     "description": "Optional session resource name returned by a previous call to continue a multi-turn conversation.",
                 },
+                "new_session": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Set to true to force creating a brand-new Agentspace session instead of continuing the active session for `session_tag`.",
+                },
                 "delete_session_after": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Set to true if this chat session will not be used again, so it is automatically deleted after the response is returned.",
+                    "description": "Set to true only for throwaway utility checks that should be deleted immediately after the response.",
                 },
                 "input_files": {
                     "type": "array",
@@ -139,6 +145,38 @@ TOOLS = [
         },
     },
     {
+        "name": "agentspace_export_slides",
+        "description": (
+            "Export a Canvas/Slides immersive artifact from an IOH Agentspace session directly into a native `.pptx` "
+            "(via `widgetExportImmersiveArtifact` RPC) and/or `.pdf` (via headless Web UI Export) inside `./outputs/<session_tag>/` "
+            "without burning any Antigravity LLM tokens."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional Agentspace session ID (if omitted, uses the active slides session for `session_tag`).",
+                },
+                "formats": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["pptx", "pdf"]},
+                    "default": ["pptx"],
+                    "description": "Export formats to generate ('pptx', 'pdf', or both).",
+                },
+                "session_tag": {
+                    "type": "string",
+                    "description": "Antigravity conversation ID prefix (e.g. '95e5efcf').",
+                },
+                "csesidx": {
+                    "type": "string",
+                    "default": DEFAULT_CSESIDX,
+                    "description": "Optional csesidx query parameter.",
+                },
+            },
+        },
+    },
+    {
         "name": "agentspace_refresh_token",
         "description": (
             "Pop up a browser window to automatically download/refresh the IOH Agentspace XSRF token "
@@ -202,6 +240,7 @@ def handle_request(msg: dict) -> dict | None:
                     save_output=save_output,
                     output_filename=args.get("output_filename"),
                     session_tag=args.get("session_tag"),
+                    new_session=bool(args.get("new_session", False)),
                     csesidx=args.get("csesidx", DEFAULT_CSESIDX),
                 )
                 if summary_only and res.get("saved_output_path"):
@@ -217,6 +256,10 @@ def handle_request(msg: dict) -> dict | None:
                     out_text = res["text"]
                     if res.get("saved_output_path"):
                         out_text += f"\n\n_Saved session-scoped output to: `{res['saved_output_path']}`_"
+                if res.get("exported_artifacts"):
+                    exp = res["exported_artifacts"]
+                    for fmt_k, info in exp.get("exported_files", {}).items():
+                        out_text += f"\n\n_Auto-exported `{fmt_k.upper()}` ({exp.get('slides_count')} slides): `{info['path']}` ({info['bytes']:,} bytes)_"
                 if res.get("session"):
                     status_note = "deleted (ephemeral)" if res.get("session_deleted") else f"`{res['session']}`"
                     out_text += f"\n\n---\n_Agentspace Session: {status_note} (Target: `{res['model']}`)_"
@@ -225,6 +268,27 @@ def handle_request(msg: dict) -> dict | None:
                     "id": msg_id,
                     "result": {
                         "content": [{"type": "text", "text": out_text}],
+                        "isError": False,
+                    },
+                }
+
+            elif name == "agentspace_export_slides":
+                exp_res = export_session_artifacts(
+                    session_id=args.get("session_id"),
+                    formats=args.get("formats") or ["pptx"],
+                    session_tag=args.get("session_tag"),
+                    csesidx=args.get("csesidx", DEFAULT_CSESIDX),
+                )
+                lines = [
+                    f"Exported **{exp_res['title']}** ({exp_res['slides_count']} slides, artifact `{exp_res['artifact_id']}`):"
+                ]
+                for fmt_k, info in exp_res["exported_files"].items():
+                    lines.append(f"- **{fmt_k.upper()}**: `{info['path']}` ({info['bytes']:,} bytes)")
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": "\n".join(lines)}],
                         "isError": False,
                     },
                 }

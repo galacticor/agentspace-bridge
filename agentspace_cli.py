@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -21,6 +22,7 @@ import urllib.request
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_XSRF_PATH = os.path.join(SCRIPT_DIR, "agentspace_xsrf.json")
 AUTH_PROFILE_DIR = os.path.join(SCRIPT_DIR, ".auth_profile")
+OUTPUTS_DIR = os.path.join(SCRIPT_DIR, "outputs")
 AGENTSPACE_ENTRY_URL = os.environ.get("AGENTSPACE_ENTRY_URL", "https://agentspace.ioh.co.id")
 WIDGET_CONFIG_ID = os.environ.get("AGENTSPACE_CONFIG_ID", "384c42b0-2885-415a-82d5-f2babc063b6e")
 DEFAULT_CSESIDX = os.environ.get("AGENTSPACE_CSESIDX", "")
@@ -359,6 +361,45 @@ def list_sessions(limit: int = 20, csesidx: str = DEFAULT_CSESIDX) -> list[dict]
     return results
 
 
+def _sanitize_slug(text: str, max_len: int = 36) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip()).strip("_").lower()
+    return cleaned[:max_len] or "output"
+
+
+def build_scoped_output_path(
+    prompt: str,
+    session_tag: str | None = None,
+    output_filename: str | None = None,
+    agentspace_session_id: str | None = None,
+) -> str:
+    """
+    Builds a session-scoped output file path inside ./outputs/<session_tag>/
+    prefixed with <session_tag>__<timestamp>__ so different Antigravity chat
+    sessions never confuse files from other chats.
+    """
+    tag = _sanitize_slug(session_tag or os.environ.get("AGY_SESSION_TAG", "chat_default"), max_len=24)
+    if not tag.startswith("chat_"):
+        tag = f"chat_{tag}"
+
+    session_dir = os.path.join(OUTPUTS_DIR, tag)
+    os.makedirs(session_dir, exist_ok=True)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    short_as_id = normalize_session_id(agentspace_session_id)[:8] if agentspace_session_id else "nosess"
+
+    if output_filename:
+        base_name = os.path.basename(output_filename)
+        name_part, ext = os.path.splitext(base_name)
+        ext = ext or ".md"
+        slug = _sanitize_slug(name_part, max_len=40)
+    else:
+        slug = _sanitize_slug(prompt, max_len=32)
+        ext = ".md"
+
+    filename = f"{tag}__{ts}__{short_as_id}__{slug}{ext}"
+    return os.path.join(session_dir, filename)
+
+
 def ask_agentspace(
     prompt: str,
     model_id: str = DEFAULT_MODEL,
@@ -367,12 +408,30 @@ def ask_agentspace(
     enable_search: bool = False,
     agent: str | None = None,
     delete_session_after: bool = False,
+    input_files: list[str] | None = None,
+    save_output: bool = False,
+    output_filename: str | None = None,
+    session_tag: str | None = None,
     csesidx: str = DEFAULT_CSESIDX,
 ) -> dict:
     resolved_agent = resolve_agent_id(agent)
 
+    full_prompt = prompt
+    attached_files: list[str] = []
+    if input_files:
+        file_blocks = []
+        for fp in input_files:
+            abs_fp = os.path.abspath(fp)
+            if not os.path.isfile(abs_fp):
+                raise FileNotFoundError(f"Input file not found: {abs_fp}")
+            with open(abs_fp, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            attached_files.append(abs_fp)
+            file_blocks.append(f"--- BEGIN FILE: {os.path.basename(abs_fp)} ---\n{content}\n--- END FILE: {os.path.basename(abs_fp)} ---")
+        full_prompt = f"{prompt}\n\n" + "\n\n".join(file_blocks)
+
     stream_req: dict = {
-        "query": {"parts": [{"text": prompt}]},
+        "query": {"parts": [{"text": full_prompt}]},
     }
 
     if session:
@@ -444,14 +503,30 @@ def ask_agentspace(
         except Exception:
             session_deleted = False
 
+    final_text = "".join(text_parts).strip()
+    saved_output_path = None
+    if save_output or output_filename:
+        saved_output_path = build_scoped_output_path(
+            prompt=prompt,
+            session_tag=session_tag,
+            output_filename=output_filename,
+            agentspace_session_id=session_name,
+        )
+        with open(saved_output_path, "w", encoding="utf-8") as f:
+            f.write(final_text)
+
     return {
-        "text": "".join(text_parts).strip(),
+        "text": final_text,
         "thoughts": "".join(thoughts).strip(),
         "function_calls": function_calls,
         "session": session_name,
         "session_deleted": session_deleted,
         "agent": resolved_agent,
         "model": model_id if not resolved_agent else f"agent:{resolved_agent}",
+        "attached_files": attached_files,
+        "saved_output_path": saved_output_path,
+        "line_count": len(final_text.splitlines()) if final_text else 0,
+        "char_count": len(final_text),
         "xsrf_source": xsrf_path,
     }
 
@@ -474,6 +549,45 @@ def main():
         dest="delete_after",
         action="store_true",
         help="Automatically delete the chat session after receiving the response",
+    )
+    parser.add_argument(
+        "--file",
+        "-f",
+        dest="input_files",
+        action="append",
+        default=[],
+        metavar="FILE_PATH",
+        help="Attach a local file directly from disk into the prompt (can be specified multiple times) to save AGY tokens",
+    )
+    parser.add_argument(
+        "--save-output",
+        action="store_true",
+        help="Save the full response into ./outputs/<session_tag>/ with a session-scoped filename",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        dest="output_filename",
+        default=None,
+        metavar="FILENAME",
+        help="Custom filename suffix (e.g. 'feature_query.sql') saved inside ./outputs/<session_tag>/",
+    )
+    parser.add_argument(
+        "--session-tag",
+        default=None,
+        metavar="TAG",
+        help="Antigravity conversation ID prefix or tag (e.g. 'bba4da86') so other chat sessions never confuse output files",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="When saving output to disk, print only the file path and a short preview to stdout to save AGY context tokens",
+    )
+    parser.add_argument(
+        "--max-preview-chars",
+        type=int,
+        default=500,
+        help="Maximum preview characters when --summary-only is used (default: 500)",
     )
     parser.add_argument(
         "--delete-session",
@@ -551,12 +665,29 @@ def main():
             enable_search=args.search,
             agent=args.agent,
             delete_session_after=args.delete_after,
+            input_files=args.input_files,
+            save_output=args.save_output or bool(args.output_filename) or args.summary_only,
+            output_filename=args.output_filename,
+            session_tag=args.session_tag,
             csesidx=args.csesidx,
         )
         if args.json:
             print(json.dumps(res, indent=2))
+        elif args.summary_only and res.get("saved_output_path"):
+            preview = res["text"][: args.max_preview_chars]
+            if len(res["text"]) > args.max_preview_chars:
+                preview += "\n... [truncated in stdout to save AGY tokens]"
+            print(
+                f"Saved full response ({res['line_count']} lines, {res['char_count']} chars) to:\n"
+                f"  {res['saved_output_path']}\n\n"
+                f"Preview:\n{preview}"
+            )
+            if res.get("session_deleted"):
+                print(f"\n[Ephemeral mode: deleted temporary session {normalize_session_id(res['session'])}]", file=sys.stderr)
         else:
             print(res["text"])
+            if res.get("saved_output_path"):
+                print(f"\n[Saved session-scoped output to: {res['saved_output_path']}]", file=sys.stderr)
             if res.get("session_deleted"):
                 print(f"\n[Ephemeral mode: deleted temporary session {normalize_session_id(res['session'])}]", file=sys.stderr)
     except urllib.error.HTTPError as e:

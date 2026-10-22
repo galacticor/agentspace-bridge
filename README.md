@@ -52,6 +52,10 @@ python agentspace_cli.py "Write a Python script to parse logs"
 # Auto-delete the chat session immediately after getting the answer (--ephemeral / --delete-after)
 python agentspace_cli.py "One-off question" --ephemeral
 
+# Maximum AGY Token-Saving Mode: attach local files directly from disk (-f) and save long outputs
+# into a session-isolated folder (./outputs/chat_<session_tag>/) with only a short preview in stdout:
+python agentspace_cli.py "Optimize this SQL" -f raw_query.sql -o optimized.sql --session-tag bba4da86 --summary-only --ephemeral
+
 # Call Netra Agent (17783079275007264980) and auto-delete the chat afterward
 python agentspace_cli.py "Check CVM RGU90 definition" --agent netra --ephemeral
 

@@ -44,6 +44,11 @@ This workspace bridges **Google Antigravity** with **IOH Agentspace** so that:
      ```powershell
      python agentspace_cli.py "Your prompt here" --ephemeral
      ```
+   - **Maximum AGY Token-Saving Mode** (attach local files directly from disk via `--file`, save long output to `./outputs/chat_<AGY_CONV_ID>/` via `--output`, and print only a short preview via `--summary-only`):
+     ```powershell
+     python agentspace_cli.py "Optimize this SQL query" -f my_query.sql -o optimized.sql --session-tag bba4da86 --summary-only --ephemeral
+     ```
+     *Rule:* Always pass the first 8 characters of your current Antigravity `Conversation ID` to `--session-tag` (or `session_tag` in MCP), and **ONLY** read files matching `outputs/chat_<current_conversation_id>/chat_<current_conversation_id>__*` so you never mix up outputs from unrelated chat sessions.
    - Call **Netra Agent** (and delete chat after response):
      ```powershell
      python agentspace_cli.py "Your Netra query here" --agent netra --ephemeral

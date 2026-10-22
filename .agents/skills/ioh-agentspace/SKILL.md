@@ -21,6 +21,15 @@ python "agentspace_cli.py" "<prompt>" --thinking MEDIUM --ephemeral
 ```
 *(Or call the `agentspace_ask` MCP tool with `enable_enterprise_search: false, delete_session_after: true`.)*
 
+### 1b. Maximum AGY Token-Saving Mode (File Input + Session-Scoped File Output)
+When sending large code/SQL files or expecting a large output (e.g., >100 lines of SQL/Python or a long report), avoid reading/dumping huge text into Antigravity's context window:
+- Pass `-f <path>` (`input_files`) so `agentspace_cli.py` reads the file directly from disk.
+- Pass `--session-tag <first_8_chars_of_AGY_Conversation_ID>` + `-o <name>` + `--summary-only` so the full output is saved to `./outputs/chat_<tag>/chat_<tag>__<timestamp>__<session_id>__<name>` and only a 500-char preview is returned to AGY:
+```powershell
+python "agentspace_cli.py" "Refactor and optimize this query" -f input.sql -o optimized.sql --session-tag bba4da86 --summary-only --ephemeral
+```
+> **Session Isolation Rule:** Never read files from `./outputs/chat_<other_tag>/` belonging to a different Antigravity conversation ID unless the user explicitly asks for them.
+
 ### 2. Calling Netra Agent (or Other Custom IOH Agents)
 Pass `--agent netra` (maps to Agent ID `17783079275007264980`, which coordinates `agent_cvm`, `agent_user_network_analytics`, `agent_techno`, `agent_export`, `agent_user_analytics`):
 ```powershell

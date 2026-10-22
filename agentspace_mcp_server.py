@@ -65,6 +65,29 @@ TOOLS = [
                     "default": False,
                     "description": "Set to true if this chat session will not be used again, so it is automatically deleted after the response is returned.",
                 },
+                "input_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of local file paths to attach directly from disk into the prompt without reading them into Antigravity's context window.",
+                },
+                "save_output": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Set to true to save the full response into `./outputs/<session_tag>/` with a session-scoped filename.",
+                },
+                "output_filename": {
+                    "type": "string",
+                    "description": "Optional filename suffix (e.g., 'feature_query.sql' or 'report.md') saved inside `./outputs/<session_tag>/`.",
+                },
+                "session_tag": {
+                    "type": "string",
+                    "description": "Antigravity conversation ID prefix or tag (e.g. 'bba4da86') so other chat sessions never confuse output files.",
+                },
+                "summary_only": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "When saving output to a file, set to true to return only the saved file path and a short 500-char preview to save Antigravity context tokens.",
+                },
                 "csesidx": {
                     "type": "string",
                     "default": DEFAULT_CSESIDX,
@@ -165,6 +188,8 @@ def handle_request(msg: dict) -> dict | None:
 
         try:
             if name == "agentspace_ask":
+                summary_only = bool(args.get("summary_only", False))
+                save_output = bool(args.get("save_output", False)) or bool(args.get("output_filename")) or summary_only
                 res = ask_agentspace(
                     prompt=args["prompt"],
                     model_id=args.get("model", DEFAULT_MODEL),
@@ -173,9 +198,25 @@ def handle_request(msg: dict) -> dict | None:
                     enable_search=bool(args.get("enable_enterprise_search", False)),
                     agent=args.get("agent"),
                     delete_session_after=bool(args.get("delete_session_after", False)),
+                    input_files=args.get("input_files"),
+                    save_output=save_output,
+                    output_filename=args.get("output_filename"),
+                    session_tag=args.get("session_tag"),
                     csesidx=args.get("csesidx", DEFAULT_CSESIDX),
                 )
-                out_text = res["text"]
+                if summary_only and res.get("saved_output_path"):
+                    preview = res["text"][:500]
+                    if len(res["text"]) > 500:
+                        preview += "\n... [truncated to save AGY context tokens]"
+                    out_text = (
+                        f"Saved full response ({res['line_count']} lines, {res['char_count']} chars) to:\n"
+                        f"`{res['saved_output_path']}`\n\n"
+                        f"**Preview:**\n{preview}"
+                    )
+                else:
+                    out_text = res["text"]
+                    if res.get("saved_output_path"):
+                        out_text += f"\n\n_Saved session-scoped output to: `{res['saved_output_path']}`_"
                 if res.get("session"):
                     status_note = "deleted (ephemeral)" if res.get("session_deleted") else f"`{res['session']}`"
                     out_text += f"\n\n---\n_Agentspace Session: {status_note} (Target: `{res['model']}`)_"

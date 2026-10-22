@@ -1,6 +1,6 @@
-# IOH Agentspace (`gemini-4-argon`) Bridge for Google Antigravity
+# IOH Agentspace (`gemini-4-argon` & Netra Agent) Bridge for Google Antigravity
 
-Connects **Google Antigravity** directly to IOH's **Gemini Enterprise (Agentspace)** instance (`https://agentspace.ioh.co.id` / `vertexaisearch.cloud.google`) using **Gemini 4 Argon (`gemini-4-argon`)** so you can offload coding tasks, reasoning, and internal IOH Confluence/SharePoint/Jira searches without burning Antigravity quota.
+Connects **Google Antigravity** directly to IOH's **Gemini Enterprise (Agentspace)** instance (`https://agentspace.ioh.co.id` / `vertexaisearch.cloud.google`) using **Gemini 4 Argon (`gemini-4-argon`)** and custom IOH Agents (**Netra Agent**, **ACE Platform**, **Slides Agent**) so you can offload coding tasks, data/CVM/network analysis, and internal IOH Confluence/SharePoint/Jira searches without burning Antigravity quota.
 
 Zero external Python dependencies required (uses Python 3 standard library only).
 
@@ -21,43 +21,46 @@ Run the setup script once to automatically add `ioh-agentspace` to `~/.gemini/co
 python setup_mcp.py
 ```
 
-### 3. Download Your Session Key (`getoxsrf`)
-Because IOH Agentspace uses Workforce Identity Federation (BYOID) without end-user GCP project IAM roles, requests are authenticated using a short-lived HS256 JWT signed by your browser session's `getoxsrf` key:
+### 3. Automatic Browser Pop-Up Token Refresh (`./agentspace_xsrf.json`)
+Because IOH Agentspace uses Workforce Identity Federation (BYOID), requests are authenticated using a short-lived HS256 JWT signed by your browser session's `getoxsrf` key (~1 hour validity).
 
-1. Log into `https://agentspace.ioh.co.id` in your browser.
-2. Check the URL bar for your `csesidx` number (e.g., `?csesidx=`).
-3. Open this URL in the same browser window (replace `<CSESIDX>` if different):
-   ```text
-   https://vertexaisearch.cloud.google/auth/getoxsrf?csesidx=
-   ```
-   *(Or open DevTools `F12` -> Console and run:)*
-   ```javascript
-   fetch(`/auth/getoxsrf?csesidx=${new URLSearchParams(location.search).get('csesidx')}`).then(r => r.text()).then(t => { copy(t); console.log("Copied!"); })
-   ```
-4. Save the downloaded file as **`~/Downloads/json.txt`** (or `./agentspace_xsrf.json` inside this folder, or `%TEMP%\agentspace_xsrf.json`).
-   - If you used the Console `copy(t)` snippet, run in PowerShell:
-     ```powershell
-     Get-Clipboard | Set-Content -Path "$env:TEMP\agentspace_xsrf.json" -Encoding UTF8
-     ```
-   - If your `csesidx` on the other PC is different from ``, pass `--csesidx <NUMBER>` or set `$env:AGENTSPACE_CSESIDX="<NUMBER>"`.
+- **Automatic Pop-Up Refresh:** Whenever `./agentspace_xsrf.json` is missing or expires (`HTTP 401`), `agentspace_cli.py` and the MCP server **automatically pop open a browser window** (`https://agentspace.ioh.co.id`) using a persistent local profile (`.auth_profile/`), grab a fresh `getoxsrf` token + `csesidx` as soon as SSO completes, save it directly to `./agentspace_xsrf.json` inside the project folder, and close the browser window.
+- **Manual Trigger:** You can also trigger a token refresh at any time via:
+  ```powershell
+  python agentspace_cli.py --refresh-token
+  ```
 
 ---
 
 ## Usage
 
-### Option A: Inside Antigravity (via MCP Tool `agentspace_ask`)
-Once `setup_mcp.py` has been run, Antigravity automatically has the `agentspace_ask` tool. Just ask Antigravity in chat:
-- *"Use `agentspace_ask` to write/analyze..."*
-- *"Use `agentspace_ask` with `enable_enterprise_search=true` to search IOH Confluence for..."*
+### Option A: Inside Antigravity (via MCP Tools)
+Once `setup_mcp.py` has been run, Antigravity has four MCP tools:
+- `agentspace_ask`: Query `gemini-4-argon` or an agent (`agent="netra"`, `agent="ace"`, `agent="slides"`). Set `delete_session_after=true` to automatically delete the chat after completion.
+- `agentspace_delete_session`: Delete an existing chat session by ID (`session_id="..."`).
+- `agentspace_list_sessions`: List recent chat sessions (`limit=20`).
+- `agentspace_refresh_token`: Pop open a browser window to refresh `./agentspace_xsrf.json`.
 
 ### Option B: Direct CLI (`agentspace_cli.py`)
 ```powershell
+# Refresh and save ./agentspace_xsrf.json via browser pop-up
+python agentspace_cli.py --refresh-token
+
 # Fast coding & reasoning (~3.5s, skips Confluence/SharePoint search)
 python agentspace_cli.py "Write a Python script to parse logs"
 
-# Enterprise Search mode (searches IOH Confluence, SharePoint, Jira, Drive + Web)
+# Auto-delete the chat session immediately after getting the answer (--ephemeral / --delete-after)
+python agentspace_cli.py "One-off question" --ephemeral
+
+# Call Netra Agent (17783079275007264980) and auto-delete the chat afterward
+python agentspace_cli.py "Check CVM RGU90 definition" --agent netra --ephemeral
+
+# Enterprise Search mode (searches IOH Confluence, SharePoint, Jira, OneDrive, ServiceNow)
 python agentspace_cli.py "Find architecture docs for..." --search
 
-# Choose thinking level (LOW, MEDIUM, HIGH, NONE) or output JSON
-python agentspace_cli.py "Complex architecture question" --thinking HIGH --json
+# List recent chat sessions
+python agentspace_cli.py --list-sessions
+
+# Delete a specific chat session when no longer needed
+python agentspace_cli.py --delete-session 6300471525476906605
 ```

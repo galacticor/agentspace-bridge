@@ -1,5 +1,6 @@
-# Never commit session tokens or XSRF keys
+# Never commit session tokens, XSRF keys, or browser auth profiles
 agentspace_xsrf.json
+.auth_profile/
 json*.txt
 getoxsrf*
 .env

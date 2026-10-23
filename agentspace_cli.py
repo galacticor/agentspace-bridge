@@ -11,6 +11,7 @@ import base64
 import glob
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -134,10 +135,13 @@ def _parse_xsrf_payload(raw_text: str) -> dict | None:
 def _find_playwright_python() -> str | None:
     """
     On macOS/Linux/Windows, if the current Python interpreter lacks `playwright`
-    (e.g. Apple's /usr/bin/python3 vs Homebrew's /opt/homebrew/bin/python3),
+    (e.g. global `python` vs `.venv/Scripts/python.exe` on Windows, or Apple's
+    `/usr/bin/python3` vs Homebrew's `/opt/homebrew/bin/python3` on macOS),
     locates an installed Python interpreter that has `playwright`.
     """
-    candidates = []
+    venv_win = os.path.join(SCRIPT_DIR, ".venv", "Scripts", "python.exe")
+    venv_unix = os.path.join(SCRIPT_DIR, ".venv", "bin", "python")
+    candidates = [venv_win, venv_unix]
     if sys.platform == "darwin":
         candidates.extend(["/opt/homebrew/bin/python3", "/usr/local/bin/python3"])
     elif sys.platform != "win32":
@@ -244,10 +248,24 @@ def _attempt_xsrf_capture(
         pass
 
     deadline = time.time() + timeout_sec
+    clicked_sso_tile = False
     while time.time() < deadline and not captured:
         for pg in list(context.pages):
             try:
                 cur_url = pg.url
+                # Multi-account Windows WAM / Entra ID picker: auto-select the @ioh.co.id tile
+                if "login.microsoftonline.com" in cur_url and not clicked_sso_tile:
+                    try:
+                        tile = pg.locator('[data-test-id*="@ioh.co.id"], div.table:has-text("@ioh.co.id")').first
+                        if tile.count() > 0 and tile.is_visible():
+                            print(
+                                "[Agentspace Auth] Auto-selecting @ioh.co.id account on Entra ID account picker ...",
+                                file=sys.stderr,
+                            )
+                            tile.click()
+                            clicked_sso_tile = True
+                    except Exception:
+                        pass
                 if cur_url.startswith(ORIGIN):
                     qs = urllib.parse.parse_qs(urllib.parse.urlparse(cur_url).query)
                     detected_cses = qs.get("csesidx", [None])[0] or csesidx
@@ -320,7 +338,7 @@ def refresh_xsrf_token(
                     csesidx=csesidx,
                     browser_channel=browser_channel,
                     headless=True,
-                    timeout_sec=15,
+                    timeout_sec=25,
                 )
             except Exception:
                 captured = {}
@@ -471,7 +489,10 @@ def _post_widget_rpc(
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
+                try:
+                    raw = resp.read().decode("utf-8")
+                except http.client.IncompleteRead as ir:
+                    raw = ir.partial.decode("utf-8", errors="replace")
                 return (json.loads(raw) if raw.strip() else {}), xsrf_path
         except urllib.error.HTTPError as e:
             if e.code in (401, 403) and auto_refresh and attempt == 0:
@@ -641,6 +662,94 @@ def list_sessions(limit: int = 20, csesidx: str = DEFAULT_CSESIDX) -> list[dict]
             "first_query": first_query,
         })
     return results
+
+
+def list_agents(include_skills: bool = True, csesidx: str = DEFAULT_CSESIDX) -> list[dict]:
+    """Lists agents and skills on IOH Agentspace via widgetListAgents and lookupWidgetConfig."""
+    results: list[dict] = []
+    seen_ids: set[str] = set()
+    try:
+        data, _ = _post_widget_rpc(
+            "widgetListAgents",
+            {
+                "configId": WIDGET_CONFIG_ID,
+                "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+                "listAgentsRequest": {"pageSize": 100},
+            },
+            csesidx=csesidx,
+            timeout=30,
+            auto_refresh=False,
+        )
+        for a in (data.get("listAgentsResponse", {}).get("agents", []) if isinstance(data, dict) else []):
+            short_id = normalize_session_id(a.get("name", ""))
+            if short_id and short_id not in seen_ids:
+                seen_ids.add(short_id)
+                results.append({
+                    "agent_id": short_id,
+                    "name": a.get("name", ""),
+                    "display_name": a.get("displayName", ""),
+                    "agent_type": a.get("agentType", "AGENT"),
+                    "state": a.get("state", ""),
+                    "sharing_type": a.get("sharingConfig", {}).get("type", ""),
+                    "description": (a.get("description") or "")[:140],
+                })
+    except Exception:
+        pass
+
+    candidate_ids: list[str] = []
+    for aid in AGENT_ALIASES.values():
+        if aid not in candidate_ids and aid != "app_catalyst_agent":
+            candidate_ids.append(aid)
+
+    for idx, aid in enumerate(candidate_ids):
+        if aid in seen_ids:
+            continue
+        try:
+            s_data = get_agent(aid, csesidx=csesidx, auto_refresh=(idx == 0))
+            a = s_data.get("agent", {})
+            if a:
+                seen_ids.add(aid)
+                ag_type = "SKILL_AGENT" if "skillAgentDefinition" in a else ("LOW_CODE" if "lowCodeAgentDefinition" in a else a.get("agentType", "AGENT"))
+                results.append({
+                    "agent_id": aid,
+                    "name": a.get("name", ""),
+                    "display_name": a.get("displayName", ""),
+                    "agent_type": ag_type,
+                    "state": a.get("state", "ENABLED"),
+                    "sharing_type": a.get("sharingConfig", {}).get("type", ""),
+                    "description": (a.get("description") or "")[:140],
+                })
+        except Exception:
+            continue
+    return results
+
+
+def get_agent(agent: str, csesidx: str = DEFAULT_CSESIDX, auto_refresh: bool = True) -> dict:
+    """Retrieves full agent or skill definition via widgetGetAgent."""
+    resolved = resolve_agent_id(agent) or agent
+    short_id = normalize_session_id(resolved)
+    payload = {
+        "configId": WIDGET_CONFIG_ID,
+        "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+        "getAgentRequest": {"name": short_id},
+    }
+    data, _ = _post_widget_rpc("widgetGetAgent", payload, csesidx=csesidx, timeout=30, auto_refresh=auto_refresh)
+    return data if isinstance(data, dict) else {"agent": data}
+
+
+def update_agent_from_file(agent_file: str, csesidx: str = DEFAULT_CSESIDX) -> dict:
+    """Updates an Agentspace agent or skill directly from a JSON file via widgetUpdateAgent."""
+    abs_path = os.path.abspath(agent_file)
+    with open(abs_path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    agent_obj = loaded.get("agent", loaded) if isinstance(loaded, dict) else loaded
+    payload = {
+        "configId": WIDGET_CONFIG_ID,
+        "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+        "updateAgentRequest": {"agent": agent_obj},
+    }
+    data, _ = _post_widget_rpc("widgetUpdateAgent", payload, csesidx=csesidx, timeout=60)
+    return data if isinstance(data, dict) else {"result": data}
 
 
 def export_session_artifacts(
@@ -1197,6 +1306,23 @@ def main():
         help="List recent chat sessions on Agentspace and exit",
     )
     parser.add_argument(
+        "--list-agents",
+        action="store_true",
+        help="List custom agents and skills on Agentspace and exit",
+    )
+    parser.add_argument(
+        "--get-agent",
+        default=None,
+        metavar="AGENT_ID_OR_ALIAS",
+        help="Fetch the full JSON definition of an agent or skill (e.g. 'office', 'office-creator', 'netra') and exit",
+    )
+    parser.add_argument(
+        "--update-agent-file",
+        default=None,
+        metavar="JSON_FILE_PATH",
+        help="Update an agent or skill on Agentspace directly from a local JSON definition file via widgetUpdateAgent and exit",
+    )
+    parser.add_argument(
         "--refresh-token",
         action="store_true",
         help="Open browser UI to download/refresh the XSRF token into ./agentspace_xsrf.json",
@@ -1240,6 +1366,39 @@ def main():
             else:
                 for s in sessions:
                     print(f"[{s['session_id']}] ({s['mode']}) {s['display_name']} | {s['start_time']} | {s['first_query']}")
+            return
+
+        if args.list_agents:
+            agents = list_agents(include_skills=True, csesidx=args.csesidx)
+            if args.json:
+                print(json.dumps(agents, indent=2))
+            else:
+                for a in agents:
+                    print(f"[{a['agent_id']}] ({a['agent_type']} | {a['state']}) {a['display_name']} — {a['description']}")
+            return
+
+        if args.get_agent:
+            agent_data = get_agent(args.get_agent, csesidx=args.csesidx)
+            if args.output_filename:
+                out_path = os.path.abspath(args.output_filename)
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(agent_data, f, indent=2)
+                print(f"Saved agent definition to: {out_path}")
+            else:
+                print(json.dumps(agent_data, indent=2))
+            return
+
+        if args.update_agent_file:
+            upd_res = update_agent_from_file(args.update_agent_file, csesidx=args.csesidx)
+            if args.json:
+                print(json.dumps(upd_res, indent=2))
+            else:
+                ag = upd_res.get("agent", {})
+                print(
+                    f"Updated agent/skill: {ag.get('displayName')} ({normalize_session_id(ag.get('name', ''))}) "
+                    f"[type={ag.get('agentType')}, state={ag.get('state')}]"
+                )
             return
 
         if args.delete_session:

@@ -1,20 +1,26 @@
-# IOH Agentspace (`gemini-4-argon` & Custom Agents) Bridge — Workspace Knowledge Base & Rules
+# IOH Agentspace (`gemini-4-argon` & Custom IOH Agents) Bridge — Workspace Knowledge Base & Rules
 
-When working in this workspace (`agentspace-bridge`), you have direct access to **IOH's Gemini Enterprise (Agentspace)** instance (`https://agentspace.ioh.co.id` / `vertexaisearch.cloud.google`) powered by **Gemini 4 Argon (`gemini-4-argon`)** as well as custom IOH Agents (including **Netra Agent**, **ACE Platform**, and **Slides Agent**).
+When working in this workspace (`agentspace-bridge`), you have direct access to **IOH's Gemini Enterprise (Agentspace)** instance (`https://agentspace.ioh.co.id` / `vertexaisearch.cloud.google`) powered by **Gemini 4 Argon (`gemini-4-argon`)**, custom IOH Agents (**Netra Agent**, **ACE Platform**), and your configured **`office-workflow-suite` Skill Agent (`14950672669329422296`)**.
 
-## 1. Purpose of This Project
-This workspace bridges **Google Antigravity** with **IOH Agentspace** so that:
-1. Antigravity can offload coding, drafting, analysis, and reasoning tasks to **Gemini 4 Argon (`gemini-4-argon`)** to save Antigravity usage quota.
-2. Antigravity can invoke specialized IOH enterprise agents like **Netra Agent (`17783079275007264980`)** (`agent_cvm`, `agent_user_network_analytics`, `agent_techno`, `agent_export`, `agent_user_analytics`).
-3. Antigravity can query internal IOH enterprise connectors (**Confluence, SharePoint, Jira, OneDrive, ServiceNow**) via Agentspace's federated search.
-4. Antigravity can clean up / delete temporary chat sessions (`widgetDeleteSession`) when a chat will not be reused.
+## 1. Purpose & Strict Scope of This Project (IOH Data & Agents Only)
+
+> [!IMPORTANT]
+> **Empirical Token Rule (Do NOT Offload General Local Coding):**
+> Never use `agentspace_cli.py` or `agentspace_ask` to offload general coding, local debugging, or unit-test fixing that Antigravity can execute locally. Routing local code fixes over an external CLI burns **4×–5× more Antigravity tokens** due to per-turn system-prompt overhead (`~30k tokens/turn`) and backgrounding turns. Solve all local coding/debugging tasks **100% locally in Antigravity**.
+
+Use **IOH Agentspace** strictly for tasks that require **IOH enterprise data, IOH internal documents, or Agentspace-hosted agents/skills**:
+1. **IOH Enterprise Agents (`--agent netra`, `--agent ace`)**: Querying live IOH subscriber, CVM, revenue, network analytics, and BigQuery marts via **Netra Agent (`17783079275007264980`)** (`agent_cvm`, `agent_user_network_analytics`, `agent_techno`, `agent_export`, `agent_user_analytics`) or **ACE Platform (`8461818071814491910`)**.
+2. **IOH Enterprise Knowledge Base Search (`--search`)**: Querying internal IOH connectors (**Confluence, SharePoint, Jira, OneDrive, ServiceNow**) via Agentspace's federated search.
+3. **IOH Executive Presentations (`.pptx`) — 3A Default vs. 3B On-Demand**:
+   - **Mode 3A (Default — Hybrid Pipeline):** Query Agentspace (`--agent netra` or `--search`) to extract IOH data into an exhaustive slide-by-slide Markdown outline (`-o slide_outline.md --summary-only`), then build the `.pptx` **locally via a delegated Antigravity subagent** (`executive-slides` + `minimal-slides` + `pptx` / `pptxgenjs` + M365 Visual QA via `office_view_hook.py`). *(Note: If the presentation uses purely local files already on disk and needs zero IOH data, skip Agentspace completely and build locally!)*
+   - **Mode 3B (When User Explicitly Requests Agentspace to Create Slides):** Invoke the user's configured **`office-workflow-suite` Skill Agent (`14950672669329422296`)** via `--agent office-workflow-suite` (or `--agent slides`), which loads `office-workflow-suite` (`references/executive-slides.md` and `references/minimal-slides.md`) inside Agentspace and auto-exports the native `.pptx` via `widgetExportImmersiveArtifact`.
 
 ---
 
 ## 2. Architecture & Technical Knowledge Base
 
 - **Target Endpoints (`https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/`):**
-  - `widgetStreamAssist`: Send chat queries to `gemini-4-argon` or specialized Agents (`agentsSpec.agentSpecs`).
+  - `widgetStreamAssist`: Send chat queries to specialized IOH Agents (`agentsSpec.agentSpecs`), Skill Agents (`load_skill` + `canvasSpec`), or Federated Search (`vertexAiSearchSpec`).
   - `widgetDeleteSession`: Delete a chat session (`deleteSessionRequest: {"name": "<short_session_id>"}`).
   - `widgetListSessions`: List recent chat sessions (`listSessionsRequest: {}`).
   - `widgetGetSession`: Retrieve full session turn & tool-call history (`getSessionRequest: {"name": "<short_session_id>", "includeAnswerDetails": true}`).
@@ -24,10 +30,11 @@ This workspace bridges **Google Antigravity** with **IOH Agentspace** so that:
 - **Widget Config ID (`cid`):** `384c42b0-2885-415a-82d5-f2babc063b6e`
 - **Underlying GCP Engine:** `projects/195467123768/locations/global/collections/default_collection/engines/enterprise-search-17429648_1742964839282`
 - **Model ID:** `gemini-4-argon` (supports `thinkingLevel`: `"LOW"`, `"MEDIUM"`, `"HIGH"`)
-- **Known Agent Aliases (`--agent`):**
+- **Known Agent & Skill Aliases (`--agent`):**
   - `netra` -> `17783079275007264980` (Netra Multi-Agent Coordinator: CVM, Network Analytics, Techno, Export, User Analytics)
   - `ace` -> `8461818071814491910` (ACE Platform Agent)
-  - `slides` / `pptx` -> `17216682253898748109` (Presentation / Research Agent)
+  - `office-workflow-suite` / `office` / `slides` / `pptx` -> `14950672669329422296` (Configured `office-workflow-suite` `SKILL_AGENT` in Agentspace; automatically invokes `load_skill` for `office-workflow-suite` + `references/executive-slides.md` & `references/minimal-slides.md`, generates Canvas slides, and exports `.pptx`)
+  - `office-creator` -> `17216682253898748109` (Legacy LOW_CODE Office File Creator)
   - `agb` -> `18420663427156982501`
   - `catalyst` -> `app_catalyst_agent`
 
@@ -41,77 +48,65 @@ This workspace bridges **Google Antigravity** with **IOH Agentspace** so that:
 - **Automatic Multi-Turn Continuity per Antigravity Chat:**
   - Always pass `--session-tag <first_8_chars_of_AGY_Conversation_ID>`.
   - `agentspace_cli.py` stores the active Agentspace session ID per mode/agent inside `./outputs/chat_<session_tag>/session_state.json`.
-  - Follow-up queries in the same Antigravity chat with the same `--session-tag` and same `--agent`/model automatically reuse the existing `[agy-bridge]` session (so you don't even need to re-attach `-f` files on Turn 2+).
+  - Follow-up queries in the same Antigravity chat with the same `--session-tag` and same `--agent`/mode automatically reuse the existing `[agy-bridge]` session.
   - Pass `--new-session` only if you want to start a fresh topic thread within the same Antigravity chat, or `--ephemeral` only for throwaway health checks.
+- **No Polling on Backgrounded Commands:** If a `run_command` call to `agentspace_cli.py` backgrounds after `WaitMsBeforeAsync`, **never** poll `manage_task` or set `schedule` timers. End your turn and wait for Antigravity's reactive wakeup (or call `agentspace_ask` via MCP).
 
-1. **Via MCP Tools (`ioh-agentspace`):**
-   - `agentspace_ask(prompt=..., agent="netra", session_tag="<8_char_id>")`: Query Netra, Slides (`agent="slides"` — auto-exports `.pptx`!), or `gemini-4-argon` (automatically prefixes new sessions with `[agy-bridge]` and reuses the session on follow-up turns for that `session_tag`).
-   - `agentspace_export_slides(session_tag="<8_char_id>", formats=["pptx", "pdf"])`: Export a Canvas/Slides presentation directly to native `.pptx` (via `widgetExportImmersiveArtifact` RPC) and/or `.pdf` (via headless Web UI Export) at zero AGY token cost.
-   - `agentspace_delete_session(session_id=...)`: Delete a specific chat session when explicitly requested.
-   - `agentspace_list_sessions(limit=20)`: List recent chat sessions.
-   - `agentspace_refresh_token(browser=...)`: Refresh and save `./agentspace_xsrf.json` inside the project folder (defaults to `"chrome"` on macOS and `"msedge"` on Windows; tries a silent headless refresh first if `.auth_profile/` already exists, and falls back to an interactive popup window when login/2FA is needed).
+### 1. Querying IOH Enterprise Data (`--agent netra` / `--agent ace`)
+```powershell
+python agentspace_cli.py "Your Netra query here" --agent netra --session-tag <8_char_conv_id>
+```
+- When expecting large tables or detailed multi-cohort reports from Netra, save directly to disk via `-o report.md --summary-only` so you only pay ~500 characters in the main chat context:
+```powershell
+python agentspace_cli.py "Extract 90d CVM conversion and ARPU by segment" --agent netra -o netra_cvm_data.md --session-tag <8_char_conv_id> --summary-only
+```
 
-2. **Via Direct CLI (`agentspace_cli.py`):**
-   - Fast coding/reasoning query (kept & prefixed with `[agy-bridge]`):
-     ```powershell
-     python agentspace_cli.py "Your prompt here" --session-tag 95e5efcf
-     ```
-   - **Maximum AGY Token-Saving Mode** (attach local files directly from disk via `--file`, save long output to `./outputs/chat_<AGY_CONV_ID>/` via `--output`, and print only a short preview via `--summary-only`):
-     ```powershell
-     python agentspace_cli.py "Optimize this SQL query" -f my_query.sql -o optimized.sql --session-tag 95e5efcf --summary-only
-     ```
-     *Rule:* Always pass the first 8 characters of your current Antigravity `Conversation ID` to `--session-tag` (or `session_tag` in MCP), and **ONLY** read files matching `outputs/chat_<current_conversation_id>/chat_<current_conversation_id>__*` so you never mix up outputs from unrelated chat sessions.
-   - Call **Netra Agent**:
-     ```powershell
-     python agentspace_cli.py "Your Netra query here" --agent netra --session-tag 95e5efcf
-     ```
-   - **Presentation / `.pptx` Generation Architecture (3-Stage Hybrid Pipeline — Default):**
-     > **CRITICAL RULE:** By default, **ALWAYS generate `.pptx` presentations locally via a delegated Antigravity subagent** (`invoke_subagent(TypeName="self")`) using our local skills (`executive-slides` + `minimal-slides` + `pptx` / `pptxgenjs` + `office_view_hook.py` Visual QA) after requesting a **complete, exhaustive slide-by-slide Markdown outline** from Agentspace (`gemini-4-argon` or `--agent netra`).
-     > - **Why:** Agentspace's internal `slidegen_agent` (`--agent slides` / `17216682253898748109` & `office-workflow-suite` / `14950672669329422296`) converts Tailwind HTML to PPTX, which cannot emit native editable PowerPoint `<c:chart>` objects and suffers from DOM-to-PPTX clipping/border-radius bugs. Our local Antigravity skill pipeline builds true native editable Office charts, crisp Tufte tables, Swiss hairline grids, and runs closed-loop M365 Visual QA (`office_view_hook.py`).
-     > - **Why Delegate to a Subagent (`invoke_subagent`):** Writing a 1,000+ line `pptxgenjs` script and inspecting rendered slide `.png` files in a subagent keeps the main Antigravity conversation context window nearly **0-token clean** while delivering superior design and UI!
+### 2. Querying IOH Enterprise Knowledge Base (`--search`)
+Query internal IOH Confluence pages, Jira tickets, SharePoint documents, OneDrive files, and ServiceNow tickets:
+```powershell
+python agentspace_cli.py "Your IOH Confluence / Jira / SharePoint query here" --search --session-tag <8_char_conv_id>
+```
 
-     **The Mandatory 3-Stage Presentation Workflow:**
-     1. **Stage 1 — Data Gathering & Exhaustive PPTX Outline in Agentspace (`0 AGY tokens`):**
-        - Query `--agent netra` (or `gemini-4-argon` with `-f` files) to extract all data and synthesize a **complete, detailed slide-by-slide Markdown outline** saved directly to `./outputs/chat_<tag>/` (`-o slide_outline.md --summary-only`).
-        - **Clear Outline Prompting Contract:** Always instruct Agentspace to structure the Markdown outline with:
-          - **Slide Number, Section Tracker, and McKinsey Action Title** (`<= 80 chars`, single-line conclusion stating the quantitative "So What?").
-          - **Context Subtitle** (`<= 110 chars`, metric, unit, cohort, and date range).
-          - **Exact Native Chart Series Payload:** Separate rate (`%` / `ARPU`) from volume (`headcount` / `IDR T`), specifying exact category labels and numerical series values so `pptxgenjs` can build native `<c:chart>` bar/column/line charts without guessing.
-          - **Complete Markdown Data Table:** Every sub-segment, cohort, headcount, share `%`, revenue, ARPU, and delta with zero omitted rows.
-          - **Analytical Nuances & Bottom Callout Strip:** Exact 1–2 sentence commercial/technical interpretation and data source footnote (`table_name`, active filters, snapshot dates).
-        ```powershell
-        python agentspace_cli.py "Based on our analysis, generate a complete, exhaustive 8-slide executive presentation outline in Markdown. For EVERY slide, explicitly provide: (1) Section Tracker & single-line McKinsey Action Title (<80 chars) with the headline metric, (2) Context Subtitle, (3) Exact Native Chart Data Series (Category Labels + Numeric Series separating rates/ARPU from volume), (4) Complete Multi-Column Data Table with all sub-segments and exact numbers, (5) Key Analytical Nuance / Strategic Takeaway Callout, and (6) Exact Source Footnote." -o pptx_detailed_outline.md --session-tag 95e5efcf --summary-only
-        ```
-     2. **Stage 2 — Delegate Local `.pptx` Build & M365 Visual QA to a Subagent (`invoke_subagent`):**
-        - Do **not** read the giant outline or render `.png` slides in the main agent context. Instead, launch `invoke_subagent(TypeName="self", Role="Executive Slide Builder & Visual QA")`.
-        - Pass the subagent:
-          1. The exact path to the Agentspace Markdown outline (`./outputs/chat_<tag>/chat_<tag>__...__pptx_detailed_outline.md`).
-          2. The target output `.pptx` path (`./outputs/chat_<tag>/chat_<tag>__local_agy_skills__<deck_name>.pptx`).
-          3. Explicit instructions to read `executive-slides`, `minimal-slides`, and `pptx` (`SKILL.md`), run `select_palette.py` on the outline, write the `pptxgenjs` builder script with native editable charts and Tufte tables, render the slides via `office_view_hook.py --pages ... --render --no-media`, visually inspect the `.png` slides via `read_file` to fix any wrapping/overlaps, and return only the final `.pptx` path + a compact summary.
-     3. **Optional Fallback (Agentspace Native Export):** Only use `python agentspace_cli.py --agent slides` / `--export-slides` if the user explicitly asks for an instant Agentspace Canvas export rather than a local executive build.
-   - Enterprise knowledge base query (IOH Confluence, SharePoint, Jira):
-     ```powershell
-     python agentspace_cli.py "Your search query here" --search --session-tag 95e5efcf
-     ```
-   - Start a brand-new session within the same Antigravity chat:
-     ```powershell
-     python agentspace_cli.py "New unrelated topic" --session-tag 95e5efcf --new-session
-     ```
-   - List or delete existing chat sessions:
-     ```powershell
-     python agentspace_cli.py --list-sessions
-     python agentspace_cli.py --delete-session 6300471525476906605
-     ```
-   - Manually trigger browser pop-up to refresh `./agentspace_xsrf.json`:
-     ```powershell
-     python agentspace_cli.py --refresh-token
-     ```
+### 3. Presentation / `.pptx` Generation Architecture (Mode 3A Default vs. Mode 3B On-Demand)
+
+#### Mode 3A (DEFAULT): Hybrid IOH Data Outline $\rightarrow$ Local Antigravity Subagent Build
+> **CRITICAL RULE:** Always default to **Mode 3A** for executive presentations.
+> - **If the deck requires IOH data:** First query `--agent netra` (or `--search`) in Agentspace to gather the data and generate a complete slide-by-slide Markdown outline (`-o pptx_detailed_outline.md --summary-only`), then delegate the `.pptx` build to a local Antigravity subagent (`invoke_subagent`).
+> - **If the deck uses purely local data files already on disk:** Do **not** call Agentspace at all—delegate directly to the local Antigravity subagent!
+
+1. **Stage 1 (When IOH Data is Needed) — Data Gathering & Exhaustive PPTX Outline in Agentspace:**
+   - Query `--agent netra` (or follow up in the same `--session-tag` thread) to synthesize a **complete, detailed slide-by-slide Markdown outline** saved to `./outputs/chat_<tag>/` (`-o pptx_detailed_outline.md --summary-only`).
+   - **Mandatory Outline Structure:**
+     - **Slide Number, Section Tracker, and McKinsey Action Title** (`<= 80 chars`, single-line conclusion stating the quantitative "So What?").
+     - **Context Subtitle** (`<= 110 chars`, metric, unit, cohort, and date range).
+     - **Exact Native Chart Series Payload:** Separate rate (`%` / `ARPU`) from volume (`headcount` / `IDR T`), specifying exact category labels and numerical series values so `pptxgenjs` can build native `<c:chart>` bar/column/line charts.
+     - **Complete Markdown Data Table:** Every sub-segment, cohort, headcount, share `%`, revenue, ARPU, and delta with zero omitted rows.
+     - **Analytical Nuances & Bottom Callout Strip:** Exact 1–2 sentence commercial/technical interpretation and data source footnote (`table_name`, active filters, snapshot dates).
+   ```powershell
+   python agentspace_cli.py "Based on our Netra analysis, generate a complete, exhaustive 8-slide executive presentation outline in Markdown. For EVERY slide, explicitly provide: (1) Section Tracker & single-line McKinsey Action Title (<80 chars) with the headline metric, (2) Context Subtitle, (3) Exact Native Chart Data Series (Category Labels + Numeric Series separating rates/ARPU from volume), (4) Complete Multi-Column Data Table with all sub-segments and exact numbers, (5) Key Analytical Nuance / Strategic Takeaway Callout, and (6) Exact Source Footnote." -o pptx_detailed_outline.md --session-tag <8_char_conv_id> --summary-only
+   ```
+2. **Stage 2 — Delegate Local `.pptx` Build & M365 Visual QA to a Subagent (`invoke_subagent`):**
+   - Launch `invoke_subagent(TypeName="self", Role="Executive Slide Builder & Visual QA")`.
+   - Pass the subagent:
+     1. The exact path to the Markdown outline (`./outputs/chat_<tag>/chat_<tag>__...__pptx_detailed_outline.md`) or local data file.
+     2. The target output `.pptx` path (`./outputs/chat_<tag>/chat_<tag>__local_agy_skills__<deck_name>.pptx`).
+     3. Explicit instructions to read `executive-slides`, `minimal-slides`, and `pptx` (`SKILL.md`), run `select_palette.py`, write the `pptxgenjs` builder script with **native editable `<c:chart>` charts** and **Tufte tables**, render the slides via `office_view_hook.py --pages ... --render --no-media`, visually inspect the `.png` slides via `read_file` to fix any wrapping/overlaps, and return only the final `.pptx` path + a compact summary.
+
+#### Mode 3B (ON-DEMAND): Agentspace Slide Creation via `office-workflow-suite` (`--agent office-workflow-suite`)
+> **When to Use Mode 3B:** Whenever the user explicitly asks for **Agentspace** to create or export the slides directly (instead of building locally in Antigravity).
+- **Always use `--agent office-workflow-suite`** (or `agent="office-workflow-suite"` / `agent="slides"` in `agentspace_ask`), which resolves to your configured `office-workflow-suite` Skill Agent (`14950672669329422296`) inside Agentspace!
+- `agentspace_cli.py` automatically prepends instructions for `gemini-4-argon` to call `load_skill` on `office-workflow-suite` and `load_skill_resource` on `references/executive-slides.md` and `references/minimal-slides.md`, builds the Canvas presentation, and automatically exports the native `.pptx` to `./outputs/chat_<tag>/` via `widgetExportImmersiveArtifact`:
+```powershell
+python agentspace_cli.py "Create an 8-slide executive presentation on <topic>" --agent office-workflow-suite --session-tag <8_char_conv_id>
+```
+*(Or via MCP: `agentspace_ask(prompt="...", agent="office-workflow-suite", session_tag="<8_char_conv_id>")`, and `agentspace_export_slides(session_tag="<8_char_conv_id>", formats=["pptx", "pdf"])` to re-export existing Canvas sessions.)*
 
 ---
 
 ## 4. Security & Token Refresh Protocol
 
-- **NEVER print or read the raw `xsrfToken` value into the chat history.** Always let `agentspace_cli.py` load the JSON file from disk.
-- **Automatic Browser Pop-up Refresh:**
-  - Whenever `agentspace_cli.py` (or the MCP server) encounters a missing token or `HTTP 401` (`SESSION_COOKIE_INVALID` after the ~1-hour token window expires), it **automatically opens a persistent browser window** (`.auth_profile/`) to `https://agentspace.ioh.co.id`, waits for SSO / page load, fetches `/auth/getoxsrf?csesidx=<csesidx>`, saves the fresh token directly to `./agentspace_xsrf.json` in the project folder, closes the browser, and retries the request.
-  - You can also explicitly run `python agentspace_cli.py --refresh-token` (or call `agentspace_refresh_token`) at any time.
+- **NEVER print or read the raw `xsrfToken` value into the chat history.** Always let `agentspace_cli.py` load `./agentspace_xsrf.json` from disk.
+- **Automatic Silent Headless Refresh (Inside `run_command` or Auto-Retry on 401):**
+  - When `./agentspace_xsrf.json` expires (`HTTP 401`/`403`) or `python agentspace_cli.py --refresh-token` is called, `agentspace_cli.py` first runs a **silent headless refresh** using the persistent `.auth_profile/` directory.
+  - On multi-account Windows PCs where Windows Web Account Manager (WAM) injects multiple Microsoft accounts (e.g., `@ioh.co.id` + a university/personal Microsoft account), `agentspace_cli.py` automatically selects the `@ioh.co.id` tile on the Entra ID `"Pick an account"` screen in headless mode (`~8s`, zero popup windows).
+  - If the underlying Entra ID refresh token itself has expired (e.g., after a password change or 2FA prompt), it automatically falls back to opening a visible Chrome/Edge window (or via `agentspace_refresh_token` MCP tool).

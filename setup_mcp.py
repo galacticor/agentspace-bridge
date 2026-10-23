@@ -14,15 +14,19 @@ import sys
 
 def _resolve_python_executable() -> str:
     """
-    Picks a Python interpreter that has `playwright` installed (e.g., Homebrew
-    /opt/homebrew/bin/python3 on macOS if /usr/bin/python3 was used to run this script),
+    Picks a Python interpreter that has `playwright` installed (e.g., local `.venv`,
+    Homebrew `/opt/homebrew/bin/python3` on macOS if `/usr/bin/python3` was used),
     while remaining 100% compatible with Windows (`sys.executable`).
     """
-    candidates = [sys.executable]
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_win = os.path.join(repo_dir, ".venv", "Scripts", "python.exe")
+    venv_unix = os.path.join(repo_dir, ".venv", "bin", "python")
+
+    candidates = [venv_win, venv_unix, sys.executable]
     if sys.platform == "darwin":
-        candidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", sys.executable]
+        candidates = [venv_unix, "/opt/homebrew/bin/python3", "/usr/local/bin/python3", sys.executable]
     elif sys.platform != "win32":
-        candidates = [sys.executable, "/usr/local/bin/python3", "/usr/bin/python3"]
+        candidates = [venv_unix, sys.executable, "/usr/local/bin/python3", "/usr/bin/python3"]
 
     for cand in candidates:
         if cand and os.path.isfile(cand):

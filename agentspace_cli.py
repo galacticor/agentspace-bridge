@@ -738,7 +738,8 @@ def get_agent(agent: str, csesidx: str = DEFAULT_CSESIDX, auto_refresh: bool = T
 
 
 def update_agent_from_file(agent_file: str, csesidx: str = DEFAULT_CSESIDX) -> dict:
-    """Updates an Agentspace agent or skill directly from a JSON file via widgetUpdateAgent."""
+    """Updates an Agentspace agent or skill directly from a JSON file via widgetUpdateAgent
+    and automatically deploys lowCodeAgentDefinition agents via widgetDeployLowCodeAgent."""
     abs_path = os.path.abspath(agent_file)
     with open(abs_path, "r", encoding="utf-8") as f:
         loaded = json.load(f)
@@ -749,7 +750,126 @@ def update_agent_from_file(agent_file: str, csesidx: str = DEFAULT_CSESIDX) -> d
         "updateAgentRequest": {"agent": agent_obj},
     }
     data, _ = _post_widget_rpc("widgetUpdateAgent", payload, csesidx=csesidx, timeout=60)
+    if isinstance(agent_obj, dict) and "lowCodeAgentDefinition" in agent_obj:
+        short_id = normalize_session_id(agent_obj.get("name", ""))
+        if short_id:
+            deploy_payload = {
+                "configId": WIDGET_CONFIG_ID,
+                "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+                "deployLowCodeAgentRequest": {"name": short_id},
+            }
+            deploy_res, _ = _post_widget_rpc("widgetDeployLowCodeAgent", deploy_payload, csesidx=csesidx, timeout=60)
+            if isinstance(data, dict):
+                data["deployOperation"] = deploy_res
     return data if isinstance(data, dict) else {"result": data}
+
+
+def download_session_media_files(
+    session_id: str,
+    file_ids: list[str] | None = None,
+    session_tag: str | None = None,
+    output_dir: str | None = None,
+    prompt_slug: str | None = None,
+    csesidx: str = DEFAULT_CSESIDX,
+) -> list[dict]:
+    """
+    Downloads AI-generated or session-attached media files (.png, .jpg, .mp4, etc.) from an
+    Agentspace session via `widgetListSessionFileMetadata` + `biz-discoveryengine.googleapis.com/...:downloadFile`.
+    Costs ZERO Antigravity LLM tokens and ZERO personal API quota!
+    """
+    short_sess = normalize_session_id(session_id)
+    full_name = format_delete_session_name(short_sess)
+    meta_payload = {
+        "configId": WIDGET_CONFIG_ID,
+        "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+        "listSessionFileMetadataRequest": {"name": full_name},
+    }
+    meta_resp, _ = _post_widget_rpc("widgetListSessionFileMetadata", meta_payload, csesidx=csesidx, timeout=30)
+    file_meta_list = (
+        meta_resp.get("listSessionFileMetadataResponse", {}).get("fileMetadata", [])
+        if isinstance(meta_resp, dict)
+        else []
+    )
+    if not file_meta_list:
+        return []
+
+    meta_by_id = {m.get("fileId"): m for m in file_meta_list if isinstance(m, dict) and m.get("fileId")}
+    if file_ids:
+        ordered_ids = [fid for fid in file_ids if fid in meta_by_id]
+        if not ordered_ids:
+            ordered_ids = list(meta_by_id.keys())
+    else:
+        ordered_ids = [
+            m.get("fileId")
+            for m in file_meta_list
+            if isinstance(m, dict) and m.get("fileId") and m.get("fileOriginType") == "AI_GENERATED"
+        ] or list(meta_by_id.keys())
+
+    if output_dir:
+        target_dir = os.path.abspath(output_dir)
+    else:
+        tag = _sanitize_slug(session_tag or os.environ.get("AGY_SESSION_TAG", "chat_default"), max_len=24)
+        if not tag.startswith("chat_"):
+            tag = f"chat_{tag}"
+        target_dir = os.path.join(OUTPUTS_DIR, tag)
+    os.makedirs(target_dir, exist_ok=True)
+
+    xsrf, _ = load_xsrf()
+    effective_csesidx = str(xsrf.get("csesidx") or csesidx)
+    jwt_tok = make_jwt(xsrf, csesidx=effective_csesidx)
+    dl_headers = _build_browser_rpc_headers(jwt_tok)
+    dl_headers.pop("Content-Type", None)
+
+    out_prefix = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+    slug_part = f"__{_sanitize_slug(prompt_slug, 28)}" if prompt_slug else ""
+
+    downloaded: list[dict] = []
+    for idx, fid in enumerate(ordered_ids, start=1):
+        meta = meta_by_id[fid]
+        raw_uri = meta.get("downloadUri", "")
+        if not raw_uri:
+            raw_uri = (
+                f"https://{HOST}/v1/{ENGINE_RESOURCE_NAME}/sessions/{short_sess}:downloadFile"
+                f"?file_id={fid}&alt=media"
+            )
+        else:
+            raw_uri = raw_uri.replace("https://discoveryengine.googleapis.com/", f"https://{HOST}/")
+
+        mime_type = meta.get("mimeType", "application/octet-stream")
+        orig_name = meta.get("name") or f"media_{fid[:8]}"
+        _, ext = os.path.splitext(orig_name)
+        if not ext:
+            if "mp4" in mime_type:
+                ext = ".mp4"
+            elif "png" in mime_type:
+                ext = ".png"
+            elif "jpeg" in mime_type or "jpg" in mime_type:
+                ext = ".jpg"
+            else:
+                ext = ".bin"
+
+        media_kind = "video" if "video" in mime_type else ("image" if "image" in mime_type else "file")
+        suffix_idx = f"_{idx}" if len(ordered_ids) > 1 else ""
+        out_filename = f"{out_prefix}{short_sess}{slug_part}__{media_kind}{suffix_idx}{ext}"
+        out_path = os.path.join(target_dir, out_filename)
+
+        req = urllib.request.Request(raw_uri, headers=dl_headers, method="GET")
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            file_bytes = resp.read()
+        with open(out_path, "wb") as f:
+            f.write(file_bytes)
+
+        summary_obj = meta.get("fileSummary", {}) if isinstance(meta.get("fileSummary"), dict) else {}
+        downloaded.append({
+            "file_id": fid,
+            "name": orig_name,
+            "mime_type": mime_type,
+            "media_type": media_kind,
+            "path": out_path,
+            "bytes": len(file_bytes),
+            "summary": summary_obj.get("summary", ""),
+        })
+    return downloaded
 
 
 def export_session_artifacts(
@@ -759,6 +879,7 @@ def export_session_artifacts(
     session_tag: str | None = None,
     output_dir: str | None = None,
     csesidx: str = DEFAULT_CSESIDX,
+    fallback_text: str | None = None,
 ) -> dict:
     """
     Exports Canvas / Slides immersive artifacts from an Agentspace session directly into
@@ -770,6 +891,8 @@ def export_session_artifacts(
     if not short_sess and not artifact_id and session_tag:
         # Try finding the latest slides or active session from session_state.json
         for candidate_mode in (
+            "skill:office-workflow-suite",
+            "skill:office-workflow-suite:lxml",
             "agent:14950672669329422296",
             "agent:17216682253898748109",
             "model:gemini-4-argon:search=0",
@@ -780,6 +903,7 @@ def export_session_artifacts(
                 break
 
     artifact_ids: list[str] = []
+    sess_data: dict = {}
     if artifact_id:
         artifact_ids.append(normalize_session_id(artifact_id))
     elif short_sess:
@@ -800,9 +924,136 @@ def export_session_artifacts(
             if aid not in artifact_ids:
                 artifact_ids.append(aid)
 
+    native_lxml_exported: dict | None = None
+    if sess_data or fallback_text:
+        all_texts: list[str] = [fallback_text] if fallback_text else []
+        all_code_blocks: list[str] = []
+        b64_pptx_payloads: list[str] = []
+        if fallback_text:
+            for m_b64 in re.findall(r"B64_PPTX:([A-Za-z0-9+/=]+)", fallback_text):
+                if len(m_b64) > 200:
+                    b64_pptx_payloads.append(m_b64)
+        sess_obj = sess_data.get("session", sess_data) if isinstance(sess_data, dict) else {}
+        for turn in sess_obj.get("turns", []):
+            ans_text = turn.get("detailedAssistAnswer", {}).get("answerText", "")
+            if ans_text:
+                all_texts.append(ans_text)
+            for rep in turn.get("detailedAssistAnswer", {}).get("replies", []):
+                gc_content = rep.get("groundedContent", {}).get("content", {})
+                t_str = gc_content.get("text", "")
+                if t_str:
+                    all_texts.append(t_str)
+                exec_code = gc_content.get("executableCode", {}).get("code", "")
+                if exec_code:
+                    all_code_blocks.append(exec_code)
+                    all_texts.append(f"```python\n{exec_code}\n```")
+                code_out = gc_content.get("codeExecutionResult", {}).get("output", "")
+                if code_out:
+                    for m_b64 in re.findall(r"B64_PPTX:([A-Za-z0-9+/=]+)", code_out):
+                        if len(m_b64) > 200:
+                            b64_pptx_payloads.append(m_b64)
+
+        if output_dir:
+            target_dir_nat = os.path.abspath(output_dir)
+        else:
+            tag_nat = _sanitize_slug(session_tag or os.environ.get("AGY_SESSION_TAG", "chat_default"), max_len=24)
+            if not tag_nat.startswith("chat_"):
+                tag_nat = f"chat_{tag_nat}"
+            target_dir_nat = os.path.join(OUTPUTS_DIR, tag_nat)
+        out_prefix_nat = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+        out_path_nat = os.path.join(target_dir_nat, f"{out_prefix_nat}{short_sess}__native_pptx.pptx")
+
+        if b64_pptx_payloads:
+            try:
+                os.makedirs(target_dir_nat, exist_ok=True)
+                raw_pptx = base64.b64decode(b64_pptx_payloads[-1])
+                with open(out_path_nat, "wb") as bf:
+                    bf.write(raw_pptx)
+                script_path_nat = os.path.splitext(out_path_nat)[0] + "_builder.py"
+                if all_code_blocks:
+                    with open(script_path_nat, "w", encoding="utf-8") as sf:
+                        sf.write(all_code_blocks[-1])
+                from pptx import Presentation as _PrsCheck
+                slides_cnt = len(_PrsCheck(out_path_nat).slides)
+                native_lxml_exported = {
+                    "path": out_path_nat,
+                    "bytes": len(raw_pptx),
+                    "script_path": script_path_nat if all_code_blocks else None,
+                    "slides_count": slides_cnt,
+                    "compiler": "agentspace_bard_python_interpreter_lxml",
+                    "mime_type": EXPORT_MIME_TYPES["pptx"],
+                }
+            except Exception:
+                native_lxml_exported = None
+
+        combined_turn_text = "\n\n".join(all_texts)
+        if not native_lxml_exported and ("create_widescreen_prs" in combined_turn_text or "from pptx" in combined_turn_text):
+            try:
+                import pptx_lxml_wrapper
+
+                os.makedirs(target_dir_nat, exist_ok=True)
+                lxml_res = pptx_lxml_wrapper.compile_python_pptx_from_response(
+                    response_text=combined_turn_text,
+                    out_pptx_path=out_path_nat,
+                )
+                native_lxml_exported = {
+                    "path": lxml_res["pptx_path"],
+                    "bytes": lxml_res["bytes"],
+                    "script_path": lxml_res["script_path"],
+                    "slides_count": lxml_res["slides_count"],
+                    "mime_type": EXPORT_MIME_TYPES["pptx"],
+                }
+            except Exception as nat_err:
+                if not artifact_ids:
+                    raise RuntimeError(f"Failed to compile native python-pptx script in session {short_sess}: {nat_err}") from nat_err
+
+        if not native_lxml_exported and not artifact_ids and short_sess:
+            try:
+                dl_media = download_session_media_files(
+                    session_id=short_sess,
+                    session_tag=session_tag,
+                    output_dir=target_dir_nat,
+                    csesidx=csesidx,
+                )
+                import zipfile
+                best_pptx_media = None
+                for m_item in dl_media:
+                    mp = m_item.get("path", "")
+                    if mp and os.path.isfile(mp) and zipfile.is_zipfile(mp):
+                        with zipfile.ZipFile(mp, "r") as zf:
+                            if "ppt/presentation.xml" in zf.namelist():
+                                if not best_pptx_media or m_item.get("bytes", 0) >= best_pptx_media.get("bytes", 0):
+                                    best_pptx_media = m_item
+                if best_pptx_media:
+                    import shutil
+                    shutil.copyfile(best_pptx_media["path"], out_path_nat)
+                    with zipfile.ZipFile(out_path_nat, "r") as zf:
+                        slides_cnt = sum(1 for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
+                    native_lxml_exported = {
+                        "path": out_path_nat,
+                        "bytes": os.path.getsize(out_path_nat),
+                        "script_path": None,
+                        "slides_count": slides_cnt,
+                        "compiler": "agentspace_session_media_pptx",
+                        "mime_type": EXPORT_MIME_TYPES["pptx"],
+                    }
+            except Exception:
+                pass
+
     if not artifact_ids:
+        if native_lxml_exported:
+            return {
+                "session_id": short_sess,
+                "artifact_id": "native_python_pptx_lxml",
+                "title": f"Native python-pptx Deck ({short_sess})",
+                "slides_count": native_lxml_exported["slides_count"],
+                "exported_files": {
+                    "pptx_native": native_lxml_exported,
+                },
+            }
+
         raise ValueError(
-            f"No immersive Canvas/Slides artifact (`immersiveArtifacts/<id>`) found in session {short_sess or '(none)'}."
+            f"No immersive Canvas/Slides artifact or native python-pptx script found in session {short_sess or '(none)'}."
         )
 
     target_artifact_id = artifact_ids[-1]
@@ -846,6 +1097,38 @@ def export_session_artifacts(
         if fmt_key == "pdf":
             need_webui_pdf = True
             continue
+
+        if fmt_key == "pptx":
+            slides_html_list = art_obj.get("slidesArtifact", {}).get("slides", [])
+            out_prefix = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+            out_filename = f"{out_prefix}{short_sess or target_artifact_id[:8]}__{slug_title}.{fmt_key}"
+            out_path = os.path.join(target_dir, out_filename)
+            if slides_html_list:
+                try:
+                    import dom_pptx_compiler
+
+                    dom_pptx_compiler.compile_slides_html_to_pptx(slides_html_list, out_path)
+                    dom_filename = f"{out_prefix}{short_sess or target_artifact_id[:8]}__{slug_title}__dom_compiled.pptx"
+                    dom_path = os.path.join(target_dir, dom_filename)
+                    if os.path.abspath(dom_path) != os.path.abspath(out_path):
+                        with open(out_path, "rb") as src_f, open(dom_path, "wb") as dst_f:
+                            dst_f.write(src_f.read())
+                    dom_bytes = os.path.getsize(out_path)
+                    exported_files["pptx"] = {
+                        "path": out_path,
+                        "bytes": dom_bytes,
+                        "mime_type": mime_type,
+                        "compiler": "html_tailwind_playwright_python_pptx_lxml",
+                    }
+                    exported_files["pptx_dom"] = {
+                        "path": dom_path,
+                        "bytes": dom_bytes,
+                        "mime_type": mime_type,
+                        "compiler": "html_tailwind_playwright_python_pptx_lxml",
+                    }
+                    continue
+                except Exception:
+                    pass
 
         exp_payload = {
             "configId": WIDGET_CONFIG_ID,
@@ -893,6 +1176,9 @@ def export_session_artifacts(
             "mime_type": EXPORT_MIME_TYPES["pdf"],
         }
 
+    if native_lxml_exported:
+        exported_files["pptx_native"] = native_lxml_exported
+
     slides_count = len(art_obj.get("slidesArtifact", {}).get("slides", []))
     return {
         "session_id": short_sess,
@@ -901,6 +1187,196 @@ def export_session_artifacts(
         "slides_count": slides_count,
         "exported_files": exported_files,
     }
+
+
+def watch_and_autocompile(
+    interval_sec: int = 8,
+    limit: int = 8,
+    session_tag: str | None = None,
+    once: bool = False,
+    csesidx: str = DEFAULT_CSESIDX,
+) -> list[dict]:
+    """
+    Zero-token background watcher that polls recent Agentspace sessions and automatically
+    compiles any new or updated `default` (Canvas HTML -> Playwright DOM) or `native`
+    (`python-pptx + lxml`) presentation sessions to `./outputs/`.
+    """
+    state_file = os.path.join(OUTPUTS_DIR, "watch_compiled_state.json")
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    compiled_state: dict[str, str] = {}
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                compiled_state = json.load(f)
+        except Exception:
+            compiled_state = {}
+
+    compiled_results: list[dict] = []
+    print(
+        f"[Agentspace Auto-Compiler Watcher] Watching latest {limit} sessions "
+        f"(interval={interval_sec}s, once={once}, 0 LLM tokens)...",
+        flush=True,
+    )
+    while True:
+        try:
+            sessions = list_sessions(limit=limit, csesidx=csesidx)
+            for s in sessions:
+                sess_id = s.get("session_id", "")
+                if not sess_id:
+                    continue
+                sig = f"{s.get('start_time', '')}|{s.get('display_name', '')}"
+                if compiled_state.get(sess_id) == sig:
+                    continue
+                try:
+                    exp_res = export_session_artifacts(
+                        session_id=sess_id,
+                        formats=("pptx",),
+                        session_tag=session_tag or "watched",
+                        csesidx=csesidx,
+                    )
+                    compiled_state[sess_id] = sig
+                    with open(state_file, "w", encoding="utf-8") as f:
+                        json.dump(compiled_state, f, indent=2)
+                    compiled_results.append(exp_res)
+                    print(
+                        f"  [AUTO-COMPILED] Session {sess_id} ('{exp_res['title']}', {exp_res['slides_count']} slides):",
+                        flush=True,
+                    )
+                    for fmt_k, info in exp_res.get("exported_files", {}).items():
+                        print(f"    -> [{fmt_k.upper()}] {info['path']} ({info['bytes']:,} bytes)", flush=True)
+                except ValueError:
+                    # Normal chat session without slides or native pptx code; mark seen so we don't re-fetch
+                    compiled_state[sess_id] = sig
+                    with open(state_file, "w", encoding="utf-8") as f:
+                        json.dump(compiled_state, f, indent=2)
+                except Exception as sess_err:
+                    print(f"  [WARN] Session {sess_id} compile warning: {sess_err}", file=sys.stderr, flush=True)
+        except KeyboardInterrupt:
+            print("\n[Agentspace Auto-Compiler Watcher] Stopped.", flush=True)
+            break
+        except Exception as poll_err:
+            print(f"[Watcher Poll Warning] {poll_err}", file=sys.stderr, flush=True)
+
+        if once:
+            break
+        try:
+            time.sleep(max(2, interval_sec))
+        except KeyboardInterrupt:
+            print("\n[Agentspace Auto-Compiler Watcher] Stopped.", flush=True)
+            break
+
+    return compiled_results
+
+
+def serve_chrome_bridge(
+    port: int = 18765,
+    session_tag: str | None = None,
+    csesidx: str = DEFAULT_CSESIDX,
+) -> None:
+    """
+    Runs a local HTTP bridge server (`http://127.0.0.1:18765`) for the Agentspace Chrome Extension.
+    Endpoints:
+      - GET /health -> {"ok": true, "port": 18765}
+      - GET /export?session=<session_id>&csesidx=<csesidx> -> Compiles the session via
+        `python-pptx + lxml` (if native script present) or Playwright DOM compiler (if Canvas slides)
+        and streams the resulting `.pptx` binary directly to Chrome Downloads!
+    """
+    import http.server
+    import urllib.parse
+
+    class BridgeHandler(http.server.BaseHTTPRequestHandler):
+        def _send_cors_headers(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PPTX-Compiler, X-PPTX-Slides")
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self._send_cors_headers()
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            if parsed.path == "/health":
+                body = json.dumps({"ok": True, "port": port, "service": "agentspace-chrome-bridge"}).encode("utf-8")
+                self.send_response(200)
+                self._send_cors_headers()
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if parsed.path == "/export":
+                raw_sess = (qs.get("session", [""])[0] or "").strip()
+                req_csesidx = (qs.get("csesidx", [csesidx])[0] or csesidx).strip()
+                req_tag = (qs.get("tag", [session_tag or "chrome_ext"])[0] or "chrome_ext").strip()
+                short_sess = normalize_session_id(raw_sess) if raw_sess else None
+
+                try:
+                    print(f"[Chrome Bridge] Compiling PPTX for session={short_sess or 'AUTO'} (csesidx={req_csesidx})...", flush=True)
+                    exp_res = export_session_artifacts(
+                        session_id=short_sess,
+                        formats=("pptx",),
+                        session_tag=req_tag,
+                        csesidx=req_csesidx,
+                    )
+                    ef = exp_res.get("exported_files", {})
+                    # Prefer native python-pptx + lxml if present, otherwise DOM-compiled pptx
+                    chosen = ef.get("pptx_native") or ef.get("pptx_dom") or ef.get("pptx")
+                    if not chosen or not os.path.isfile(chosen.get("path", "")):
+                        raise RuntimeError(f"No compiled PPTX file produced for session {short_sess}")
+
+                    pptx_path = chosen["path"]
+                    compiler_type = "native_python_pptx_lxml" if "pptx_native" in ef else chosen.get("compiler", "dom_playwright_pptx")
+                    filename = os.path.basename(pptx_path)
+                    with open(pptx_path, "rb") as f:
+                        pptx_bytes = f.read()
+
+                    self.send_response(200)
+                    self._send_cors_headers()
+                    self.send_header("Content-Type", EXPORT_MIME_TYPES["pptx"])
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.send_header("Content-Length", str(len(pptx_bytes)))
+                    self.send_header("X-PPTX-Compiler", compiler_type)
+                    self.send_header("X-PPTX-Slides", str(exp_res.get("slides_count", 0)))
+                    self.end_headers()
+                    self.wfile.write(pptx_bytes)
+                    print(f"[Chrome Bridge] -> Sent {filename} ({len(pptx_bytes):,} bytes, compiler={compiler_type})", flush=True)
+                except Exception as exc:
+                    err_msg = str(exc)
+                    print(f"[Chrome Bridge ERROR] {err_msg}", file=sys.stderr, flush=True)
+                    err_body = json.dumps({"ok": False, "error": err_msg, "session": short_sess}).encode("utf-8")
+                    self.send_response(400)
+                    self._send_cors_headers()
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                return
+
+            self.send_response(404)
+            self._send_cors_headers()
+            self.end_headers()
+
+        def log_message(self, format: str, *args) -> None:
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), BridgeHandler)
+    print(
+        f"[Agentspace Chrome Bridge] Listening on http://127.0.0.1:{port} "
+        f"(Ready for '⬇ Native PPTX' clicks in Google Chrome!)",
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[Agentspace Chrome Bridge] Stopped.", flush=True)
+    finally:
+        server.server_close()
 
 
 def _export_pdf_via_webui(
@@ -1025,14 +1501,21 @@ def ask_agentspace(
     output_filename: str | None = None,
     session_tag: str | None = None,
     new_session: bool = False,
+    python_pptx: bool = False,
     csesidx: str = DEFAULT_CSESIDX,
 ) -> dict:
+    if python_pptx and not agent:
+        agent = "office-workflow-suite"
     resolved_agent = resolve_agent_id(agent)
     skill_name = SKILL_AGENT_IDS.get(resolved_agent) if resolved_agent else None
     mode_key = (
-        f"skill:{skill_name}"
-        if skill_name
-        else (f"agent:{resolved_agent}" if resolved_agent else f"model:{model_id}:search={int(bool(enable_search))}")
+        f"skill:{skill_name}:lxml"
+        if (skill_name and python_pptx)
+        else (
+            f"skill:{skill_name}"
+            if skill_name
+            else (f"agent:{resolved_agent}" if resolved_agent else f"model:{model_id}:search={int(bool(enable_search))}")
+        )
     )
 
     effective_session = session
@@ -1047,12 +1530,23 @@ def ask_agentspace(
         reused_existing_session = True
 
     full_prompt = prompt
-    if skill_name and skill_name.lower() not in full_prompt.lower():
-        full_prompt = (
-            f"First call `load_skill` for `{skill_name}` (and any relevant reference files via `load_skill_resource`, "
-            f"such as `references/executive-slides.md` and `references/minimal-slides.md`), then follow its instructions "
-            f"to fulfill this request:\n\n{full_prompt}"
-        )
+    if python_pptx:
+        import pptx_lxml_wrapper
+
+        full_prompt = f"{pptx_lxml_wrapper.PYTHON_PPTX_PROMPT_PREFIX}{full_prompt}"
+    if skill_name and f"mention://?uri={resolved_agent}" not in full_prompt:
+        mention_pill = f"[{skill_name}](mention://?uri={resolved_agent})"
+        if python_pptx:
+            full_prompt = (
+                f"{mention_pill} First call `load_skill` for `{skill_name}` (do NOT call `save_slides_to_artifact`—instead follow "
+                f"Section 7C `/home/bard` `pptx_lxml_wrapper` instructions, execute in `file_and_coding_agent`, and output the runnable Python script):\n\n{full_prompt}"
+            )
+        else:
+            full_prompt = (
+                f"{mention_pill} First call `load_skill` for `{skill_name}` (and any relevant reference files via `load_skill_resource`, "
+                f"such as `references/executive-slides.md` and `references/minimal-slides.md`), then follow its instructions "
+                f"to fulfill this request:\n\n{full_prompt}"
+            )
 
     attached_files: list[str] = []
     if input_files:
@@ -1074,12 +1568,18 @@ def ask_agentspace(
     if effective_session:
         stream_req["session"] = effective_session
 
+    onedrive_ds_specs = [
+        {
+            "dataStore": "collections/default_collection/dataStores/onedrive-federated-live_1776136353357_file"
+        }
+    ]
     if resolved_agent and not skill_name:
         stream_req["answerGenerationMode"] = "AGENT"
         stream_req["agentsSpec"] = {
             "agentSpecs": [{"agentId": resolved_agent}]
         }
         stream_req["toolsSpec"] = {
+            "vertexAiSearchSpec": {"dataStoreSpecs": onedrive_ds_specs},
             "webGroundingSpec": {},
             "imageGenerationSpec": {},
             "videoGenerationSpec": {},
@@ -1093,9 +1593,9 @@ def ask_agentspace(
             stream_req["generationSpec"] = {
                 "thinkingConfig": {"thinkingLevel": thinking_level.upper()}
             }
-        if enable_search:
+        if enable_search or skill_name or ("onedrive" in full_prompt.lower()):
             stream_req["toolsSpec"] = {
-                "vertexAiSearchSpec": {},
+                "vertexAiSearchSpec": {"dataStoreSpecs": onedrive_ds_specs},
                 "webGroundingSpec": {},
                 "imageGenerationSpec": {},
                 "videoGenerationSpec": {},
@@ -1118,17 +1618,100 @@ def ask_agentspace(
         "streamAssistRequest": stream_req,
     }
 
-    timeout_sec = 300 if (resolved_agent or skill_name) else 180
-    chunks, xsrf_path = _post_widget_rpc("widgetStreamAssist", payload, csesidx=csesidx, timeout=timeout_sec)
+    timeout_sec = 300
+    chunks: list | dict = []
+    xsrf_path = ""
+    for rpc_try in range(4):
+        chunks, xsrf_path = _post_widget_rpc("widgetStreamAssist", payload, csesidx=csesidx, timeout=timeout_sec)
+        stream_err = None
+        if isinstance(chunks, list):
+            for ch in chunks:
+                if isinstance(ch, dict) and "error" in ch:
+                    stream_err = ch["error"]
+                    break
+        if stream_err and rpc_try < 3:
+            err_reason = ""
+            for det in stream_err.get("details", []):
+                if isinstance(det, dict) and det.get("reason"):
+                    err_reason = det["reason"]
+                    break
+            wait_s = 6 * (rpc_try + 1)
+            print(
+                f"[Agentspace Stream Error: {err_reason or stream_err.get('status') or stream_err.get('code')} "
+                f"(attempt {rpc_try + 1}/4). Retrying in {wait_s}s...]",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait_s)
+            continue
+        break
+
+    # Automatically confirm connector actionInvocation turns (e.g. onedrive_agent__upload_file)
+    for _confirm_step in range(3):
+        if not isinstance(chunks, list):
+            break
+        pending_action = None
+        last_answer_name = None
+        curr_sess = effective_session
+        for ch in chunks:
+            sar = ch.get("streamAssistResponse", {}) if isinstance(ch, dict) else {}
+            if sar.get("sessionInfo", {}).get("session"):
+                curr_sess = sar["sessionInfo"]["session"]
+            ans = sar.get("answer", {})
+            if ans.get("name"):
+                last_answer_name = ans["name"]
+            for rep in ans.get("replies", []):
+                if "actionInvocation" in rep and rep["actionInvocation"].get("actionConfirmationRequired"):
+                    pending_action = rep["actionInvocation"]
+        if not pending_action or not curr_sess:
+            break
+        confirm_req = {
+            "session": curr_sess,
+            "query": {"parts": [{"text": "Action Confirmed"}]},
+            "assistSkippingMode": 1,
+            "answerGenerationMode": stream_req["answerGenerationMode"],
+            "toolsSpec": stream_req["toolsSpec"],
+            "actionExecutionParams": {
+                "agentName": pending_action.get("agentName", "root_agent"),
+                "actionName": pending_action.get("actionName", ""),
+                "actionInvocationId": pending_action.get("invocationId", ""),
+                "assistAnswerName": last_answer_name,
+                "args": pending_action.get("args", {}),
+            },
+        }
+        if "agentsSpec" in stream_req:
+            confirm_req["agentsSpec"] = stream_req["agentsSpec"]
+        if "assistGenerationConfig" in stream_req:
+            confirm_req["assistGenerationConfig"] = stream_req["assistGenerationConfig"]
+        confirm_payload = {
+            "configId": WIDGET_CONFIG_ID,
+            "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+            "streamAssistRequest": confirm_req,
+        }
+        more_chunks, _ = _post_widget_rpc("widgetStreamAssist", confirm_payload, csesidx=csesidx, timeout=timeout_sec)
+        if isinstance(more_chunks, list):
+            for ch in chunks:
+                sar = ch.get("streamAssistResponse", {}) if isinstance(ch, dict) else {}
+                for rep in sar.get("answer", {}).get("replies", []):
+                    if "actionInvocation" in rep:
+                        rep.pop("actionInvocation", None)
+            chunks.extend(more_chunks)
+        else:
+            break
 
     text_parts = []
     thoughts = []
     function_calls = []
+    stream_errors: list[dict] = []
+    final_media_file_ids: list[str] = []
+    all_media_file_ids: list[str] = []
     has_immersive_artifact = False
     session_name = effective_session
 
     if isinstance(chunks, list):
         for chunk in chunks:
+            if isinstance(chunk, dict) and "error" in chunk:
+                stream_errors.append(chunk["error"])
             sar = chunk.get("streamAssistResponse", {})
             if sar.get("sessionInfo", {}).get("session"):
                 session_name = sar["sessionInfo"]["session"]
@@ -1143,11 +1726,45 @@ def ask_agentspace(
                     if fname == "save_slides_to_artifact":
                         has_immersive_artifact = True
                 content = rep.get("groundedContent", {}).get("content", {})
+                if "file" in content and isinstance(content["file"], dict):
+                    fid = content["file"].get("fileId")
+                    if fid:
+                        if fid not in all_media_file_ids:
+                            all_media_file_ids.append(fid)
+                        if not content.get("thought") and fid not in final_media_file_ids:
+                            final_media_file_ids.append(fid)
+                if "functionCall" in content:
+                    fname = content["functionCall"].get("name") or content["functionCall"].get("functionName", "unknown")
+                    function_calls.append(fname)
+                    if fname == "save_slides_to_artifact":
+                        has_immersive_artifact = True
+                if "executableCode" in content:
+                    exec_c = content["executableCode"].get("code", "")
+                    if exec_c:
+                        text_parts.append(f"\n```python\n{exec_c}\n```\n")
+                if "codeExecutionResult" in content:
+                    c_out = content["codeExecutionResult"].get("output", "")
+                    if "B64_PPTX:" in c_out:
+                        text_parts.append(f"\n{c_out}\n")
                 if content.get("thought"):
                     if "text" in content:
                         thoughts.append(content["text"])
                 elif "text" in content:
                     text_parts.append(content["text"])
+
+    target_media_ids = final_media_file_ids or all_media_file_ids
+    generated_media: list[dict] = []
+    if session_name and target_media_ids:
+        try:
+            generated_media = download_session_media_files(
+                session_id=session_name,
+                file_ids=target_media_ids,
+                session_tag=session_tag,
+                prompt_slug=output_filename or prompt,
+                csesidx=csesidx,
+            )
+        except Exception:
+            generated_media = []
 
     session_deleted = False
     display_name = None
@@ -1175,24 +1792,62 @@ def ask_agentspace(
 
     final_text = "".join(text_parts).strip()
     saved_output_path = None
-    if save_output or output_filename:
+    if save_output or output_filename or python_pptx:
         saved_output_path = build_scoped_output_path(
             prompt=prompt,
             session_tag=session_tag,
             output_filename=output_filename,
             agentspace_session_id=session_name,
         )
-        with open(saved_output_path, "w", encoding="utf-8") as f:
-            f.write(final_text)
+        if not python_pptx or (output_filename and not output_filename.lower().endswith(".pptx")):
+            with open(saved_output_path, "w", encoding="utf-8") as f:
+                f.write(final_text)
 
     exported_artifacts = None
-    if session_name and not session_deleted and (has_immersive_artifact or resolved_agent in SLIDES_AGENT_IDS):
+    if python_pptx and final_text:
+        try:
+            import pptx_lxml_wrapper
+
+            if output_filename and output_filename.lower().endswith(".pptx"):
+                target_pptx = saved_output_path
+            else:
+                base_path = saved_output_path or build_scoped_output_path(
+                    prompt=prompt,
+                    session_tag=session_tag,
+                    output_filename="lxml_deck.pptx",
+                    agentspace_session_id=session_name,
+                )
+                target_pptx = os.path.splitext(base_path)[0] + "__python_pptx_lxml.pptx"
+
+            lxml_res = pptx_lxml_wrapper.compile_python_pptx_from_response(
+                response_text=final_text,
+                out_pptx_path=target_pptx,
+            )
+            exported_artifacts = {
+                "session_id": normalize_session_id(session_name) if session_name else "",
+                "artifact_id": "python_pptx_lxml",
+                "title": "python-pptx + lxml Native Deck",
+                "slides_count": lxml_res["slides_count"],
+                "exported_files": {
+                    "pptx_lxml": {
+                        "format": "pptx",
+                        "path": lxml_res["pptx_path"],
+                        "bytes": lxml_res["bytes"],
+                        "script_path": lxml_res["script_path"],
+                    }
+                },
+            }
+            saved_output_path = lxml_res["script_path"]
+        except Exception as exc:
+            exported_artifacts = {"error": str(exc)}
+    elif session_name and not session_deleted and (has_immersive_artifact or resolved_agent in SLIDES_AGENT_IDS):
         try:
             exported_artifacts = export_session_artifacts(
                 session_id=session_name,
                 formats=("pptx",),
                 session_tag=session_tag,
                 csesidx=csesidx,
+                fallback_text=final_text,
             )
         except Exception:
             exported_artifacts = None
@@ -1201,6 +1856,7 @@ def ask_agentspace(
         "text": final_text,
         "thoughts": "".join(thoughts).strip(),
         "function_calls": function_calls,
+        "generated_media": generated_media,
         "session": session_name,
         "session_reused": reused_existing_session,
         "session_display_name": display_name,
@@ -1226,6 +1882,20 @@ def main():
         "--agent",
         default=None,
         help="Optional Agent alias ('netra', 'ace', 'slides', 'agb', 'catalyst') or numeric Agent ID",
+    )
+    parser.add_argument(
+        "--pptx-mode",
+        choices=["default", "native"],
+        default=None,
+        help="Presentation mode: 'default' (HTML/Tailwind Canvas -> Playwright DOM .pptx) or 'native' (python-pptx + lxml script -> .pptx)",
+    )
+    parser.add_argument(
+        "--native-pptx",
+        "--python-pptx",
+        "--pptx-lxml",
+        dest="python_pptx",
+        action="store_true",
+        help="Use 'native' pptx mode: ask Agentspace (gemini-4-argon + office-workflow-suite) for a python-pptx + lxml script and compile it locally to .pptx at 0 AGY coding tokens",
     )
     parser.add_argument("--session", default=None, help="Optional session resource name to continue a conversation")
     parser.add_argument(
@@ -1301,6 +1971,12 @@ def main():
         help="Comma-separated export formats for --export-slides: 'pptx', 'pdf', or 'pptx,pdf' (default: pptx)",
     )
     parser.add_argument(
+        "--download-media",
+        default=None,
+        metavar="SESSION_ID",
+        help="Download AI-generated or attached media files (.png, .mp4) from an Agentspace session and exit",
+    )
+    parser.add_argument(
         "--list-sessions",
         action="store_true",
         help="List recent chat sessions on Agentspace and exit",
@@ -1332,6 +2008,35 @@ def main():
         default=DEFAULT_BROWSER_CHANNEL,
         help=f"Browser channel for --refresh-token (default on this OS: {DEFAULT_BROWSER_CHANNEL}; supports chrome or msedge)",
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run zero-token background auto-compiler watcher that polls recent Web UI sessions and compiles native/DOM .pptx files",
+    )
+    parser.add_argument(
+        "--watch-once",
+        action="store_true",
+        help="Run a single pass of the auto-compiler watcher on recent sessions and exit",
+    )
+    parser.add_argument(
+        "--watch-interval",
+        type=int,
+        default=8,
+        help="Polling interval in seconds for --watch (default: 8)",
+    )
+    parser.add_argument(
+        "--serve-chrome",
+        "--serve",
+        dest="serve_chrome",
+        action="store_true",
+        help="Start local HTTP bridge on http://127.0.0.1:18765 for the Agentspace Chrome Extension ('⬇ Native PPTX' button)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=18765,
+        help="Local port for --serve-chrome (default: 18765)",
+    )
     parser.add_argument("--limit", type=int, default=20, help="Number of sessions to list with --list-sessions")
     parser.add_argument("--csesidx", default=DEFAULT_CSESIDX, help="Browser session index (csesidx) from URL")
     parser.add_argument("--search", action="store_true", help="Enable Enterprise Search (Confluence/SharePoint/Jira) & Web Grounding")
@@ -1339,6 +2044,24 @@ def main():
     args = parser.parse_args()
 
     try:
+        if args.serve_chrome:
+            serve_chrome_bridge(
+                port=args.port,
+                session_tag=args.session_tag,
+                csesidx=args.csesidx,
+            )
+            return
+        if args.watch or args.watch_once:
+            watch_res = watch_and_autocompile(
+                interval_sec=args.watch_interval,
+                limit=min(args.limit, 10),
+                session_tag=args.session_tag,
+                once=args.watch_once,
+                csesidx=args.csesidx,
+            )
+            if args.json:
+                print(json.dumps(watch_res, indent=2))
+            return
         if args.refresh_token:
             data, saved_path = refresh_xsrf_token(csesidx=args.csesidx, browser_channel=args.browser)
             if not args.prompt and not args.list_sessions and not args.delete_session:
@@ -1409,6 +2132,21 @@ def main():
                 print(f"Deleted session: {res['session_id']}")
             return
 
+        if args.download_media and not args.prompt:
+            dl_files = download_session_media_files(
+                session_id=args.download_media,
+                session_tag=args.session_tag,
+                prompt_slug=args.output_filename,
+                csesidx=args.csesidx,
+            )
+            if args.json:
+                print(json.dumps(dl_files, indent=2))
+            else:
+                print(f"Downloaded {len(dl_files)} media file(s) from session {normalize_session_id(args.download_media)}:")
+                for m in dl_files:
+                    print(f"  [{m['media_type'].upper()} | {m['mime_type']}] {m['path']} ({m['bytes']:,} bytes)")
+            return
+
         if args.export_slides and not args.prompt:
             target_sess = None if args.export_slides == "AUTO" else args.export_slides
             fmts = [x.strip() for x in args.export_format.split(",") if x.strip()]
@@ -1429,7 +2167,11 @@ def main():
             return
 
         if not args.prompt:
-            parser.error("A prompt is required unless --list-sessions, --delete-session, or --export-slides is specified.")
+            parser.error("A prompt is required unless --list-sessions, --delete-session, --export-slides, or --download-media is specified.")
+
+        use_native_pptx = bool(args.python_pptx or (args.pptx_mode and args.pptx_mode.lower() == "native"))
+        if args.pptx_mode and args.pptx_mode.lower() == "default" and not args.agent:
+            args.agent = "office-workflow-suite"
 
         res = ask_agentspace(
             prompt=args.prompt,
@@ -1440,15 +2182,16 @@ def main():
             agent=args.agent,
             delete_session_after=args.delete_after,
             input_files=args.input_files,
-            save_output=args.save_output or bool(args.output_filename) or args.summary_only,
+            save_output=args.save_output or bool(args.output_filename) or args.summary_only or use_native_pptx,
             output_filename=args.output_filename,
             session_tag=args.session_tag,
             new_session=args.new_session,
+            python_pptx=use_native_pptx,
             csesidx=args.csesidx,
         )
         if args.json:
             print(json.dumps(res, indent=2))
-        elif args.summary_only and res.get("saved_output_path"):
+        elif (args.summary_only or use_native_pptx) and res.get("saved_output_path"):
             preview = res["text"][: args.max_preview_chars]
             if len(res["text"]) > args.max_preview_chars:
                 preview += "\n... [truncated in stdout to save AGY tokens]"
@@ -1457,8 +2200,12 @@ def main():
                 f"  {res['saved_output_path']}\n\n"
                 f"Preview:\n{preview}"
             )
+            for m in res.get("generated_media", []):
+                print(f"\n[Auto-Downloaded {m['media_type'].upper()} ({m['mime_type']}): {m['path']} ({m['bytes']:,} bytes)]")
             if res.get("exported_artifacts"):
                 exp = res["exported_artifacts"]
+                if exp.get("error"):
+                    print(f"\n[python-pptx Compile Error: {exp['error']}]", file=sys.stderr)
                 for fmt_k, info in exp.get("exported_files", {}).items():
                     print(f"\n[Auto-Exported {fmt_k.upper()} ({exp.get('slides_count')} slides): {info['path']} ({info['bytes']:,} bytes)]")
             if res.get("session_deleted"):
@@ -1467,7 +2214,10 @@ def main():
                 mode_note = "Continued" if res.get("session_reused") else f"Created ({res.get('session_display_name') or '[agy-bridge]'})"
                 print(f"\n[Agentspace Session {mode_note}: {normalize_session_id(res['session'])}]", file=sys.stderr)
         else:
-            print(res["text"])
+            if res["text"]:
+                print(res["text"])
+            for m in res.get("generated_media", []):
+                print(f"[Auto-Downloaded {m['media_type'].upper()} ({m['mime_type']}): {m['path']} ({m['bytes']:,} bytes)]")
             if res.get("saved_output_path"):
                 print(f"\n[Saved session-scoped output to: {res['saved_output_path']}]", file=sys.stderr)
             if res.get("exported_artifacts"):

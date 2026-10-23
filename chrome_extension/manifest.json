@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "IOH Agentspace — Native PPTX Exporter",
+  "version": "1.0.0",
+  "description": "Adds a sleek '⬇ Native PPTX' button to the top-right corner of every IOH Agentspace session to compile and download python-pptx + lxml or DOM-fixed slides.",
+  "permissions": [
+    "downloads"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:18765/*",
+    "http://localhost:18765/*",
+    "https://vertexaisearch.cloud.google/*",
+    "https://agentspace.ioh.co.id/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://vertexaisearch.cloud.google/*",
+        "https://agentspace.ioh.co.id/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

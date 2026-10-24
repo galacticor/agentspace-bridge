@@ -10,11 +10,14 @@ import json
 import sys
 from agentspace_cli import (
     ask_agentspace,
+    cleanup_media_sessions,
     delete_session,
     export_session_artifacts,
+    finish_task_sessions,
     list_sessions,
     refresh_xsrf_token,
     DEFAULT_BROWSER_CHANNEL,
+    DEFAULT_MAX_MEDIA_PROMPTS,
     DEFAULT_MODEL,
     DEFAULT_THINKING,
     DEFAULT_CSESIDX,
@@ -24,25 +27,31 @@ TOOLS = [
     {
         "name": "agentspace_ask",
         "description": (
-            "Offload a prompt, coding question, analysis, specialized agent query (e.g. 'netra', 'ace', 'slides'), "
-            "or enterprise search query (Confluence, SharePoint, Jira) to IOH's Gemini Enterprise (Agentspace) "
-            "running Gemini 4 Argon (`gemini-4-argon`). Set `delete_session_after=true` for one-off queries so the "
-            "chat session is automatically deleted after receiving the answer."
+            "Query IOH's Gemini Enterprise (Agentspace) for tasks requiring IOH enterprise data or internal knowledge: "
+            "(1) specialized IOH data agents ('netra', 'ace'), (2) internal IOH enterprise search connectors "
+            "(Confluence, SharePoint, Jira, OneDrive, ServiceNow), or (3) IOH executive presentations "
+            "('office-workflow-suite' / 'slides' / 'office-creator'). Do NOT use this tool to offload general local coding."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "The prompt or question to send to Gemini 4 Argon or an Agentspace Agent.",
+                    "description": "The prompt or question to send to an Agentspace Agent or Gemini 4 Argon.",
                 },
                 "agent": {
                     "type": "string",
                     "description": (
                         "Optional agent alias ('netra' for Netra Multi-Agent Coordinator 17783079275007264980, "
-                        "'ace' for ACE Platform 8461818071814491910, 'slides' for PPTX Agent 17216682253898748109, "
+                        "'ace' for ACE Platform 8461818071814491910, 'office-workflow-suite' / 'slides' / 'pptx' for "
+                        "Skill Agent 14950672669329422296, 'office-creator' for Office File Creator 17216682253898748109, "
                         "'agb' for 18420663427156982501, 'catalyst' for app_catalyst_agent) or raw numeric Agent ID."
                     ),
+                },
+                "python_pptx": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Set to true to use native python-pptx + lxml compilation mode with office-workflow-suite.",
                 },
                 "model": {
                     "type": "string",
@@ -97,6 +106,11 @@ TOOLS = [
                     "default": False,
                     "description": "When saving output to a file, set to true to return only the saved file path and a short 500-char preview to save Antigravity context tokens.",
                 },
+                "max_media_prompts": {
+                    "type": "integer",
+                    "default": DEFAULT_MAX_MEDIA_PROMPTS,
+                    "description": "Auto-clear/rotate media generation session after N prompts (default: 3).",
+                },
                 "csesidx": {
                     "type": "string",
                     "default": DEFAULT_CSESIDX,
@@ -104,6 +118,59 @@ TOOLS = [
                 },
             },
             "required": ["prompt"],
+        },
+    },
+    {
+        "name": "agentspace_finish_task",
+        "description": (
+            "Delete tracked media sessions (and any `_img*`/`_vid*` sub-sessions) for a finished subagent or task "
+            "(`session_tag`) so image/video generation chats do not clutter the Agentspace Web UI sidebar."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_tag": {
+                    "type": "string",
+                    "description": "The Antigravity conversation ID prefix or task tag (e.g. '7cb9cd02').",
+                },
+                "media_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "If true (default), deletes only media sessions and single-asset sub-sessions while preserving Netra/Search/Slides sessions.",
+                },
+                "csesidx": {
+                    "type": "string",
+                    "default": DEFAULT_CSESIDX,
+                    "description": "Optional csesidx query parameter.",
+                },
+            },
+            "required": ["session_tag"],
+        },
+    },
+    {
+        "name": "agentspace_cleanup_media_sessions",
+        "description": (
+            "Scan recent Agentspace sessions and delete image/video generation chat sessions to declutter the Web UI sidebar."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Number of recent sessions to scan (default: 50).",
+                },
+                "keep_latest": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "Number of most recent media sessions to keep (default: 0).",
+                },
+                "csesidx": {
+                    "type": "string",
+                    "default": DEFAULT_CSESIDX,
+                    "description": "Optional csesidx query parameter.",
+                },
+            },
         },
     },
     {
@@ -230,7 +297,8 @@ def handle_request(msg: dict) -> dict | None:
         try:
             if name == "agentspace_ask":
                 summary_only = bool(args.get("summary_only", False))
-                save_output = bool(args.get("save_output", False)) or bool(args.get("output_filename")) or summary_only
+                python_pptx = bool(args.get("python_pptx", False))
+                save_output = bool(args.get("save_output", False)) or bool(args.get("output_filename")) or summary_only or python_pptx
                 res = ask_agentspace(
                     prompt=args["prompt"],
                     model_id=args.get("model", DEFAULT_MODEL),
@@ -244,9 +312,11 @@ def handle_request(msg: dict) -> dict | None:
                     output_filename=args.get("output_filename"),
                     session_tag=args.get("session_tag"),
                     new_session=bool(args.get("new_session", False)),
+                    python_pptx=python_pptx,
+                    max_media_prompts=int(args.get("max_media_prompts", DEFAULT_MAX_MEDIA_PROMPTS)),
                     csesidx=args.get("csesidx", DEFAULT_CSESIDX),
                 )
-                if summary_only and res.get("saved_output_path"):
+                if (summary_only or python_pptx) and res.get("saved_output_path"):
                     preview = res["text"][:500]
                     if len(res["text"]) > 500:
                         preview += "\n... [truncated to save AGY context tokens]"
@@ -259,18 +329,58 @@ def handle_request(msg: dict) -> dict | None:
                     out_text = res["text"]
                     if res.get("saved_output_path"):
                         out_text += f"\n\n_Saved session-scoped output to: `{res['saved_output_path']}`_"
+                for m in res.get("generated_media", []):
+                    out_text += f"\n\n_Auto-downloaded `{m['media_type'].upper()}` (`{m['mime_type']}`): `{m['path']}` ({m['bytes']:,} bytes)_"
                 if res.get("exported_artifacts"):
                     exp = res["exported_artifacts"]
+                    if exp.get("error"):
+                        out_text += f"\n\n_python-pptx Compile Error: `{exp['error']}`_"
                     for fmt_k, info in exp.get("exported_files", {}).items():
                         out_text += f"\n\n_Auto-exported `{fmt_k.upper()}` ({exp.get('slides_count')} slides): `{info['path']}` ({info['bytes']:,} bytes)_"
+                if res.get("rotated_previous_media_session"):
+                    out_text += f"\n\n_Media session rotated: deleted previous 3-prompt session `{res['rotated_previous_media_session']}`_"
                 if res.get("session"):
-                    status_note = "deleted (ephemeral)" if res.get("session_deleted") else f"`{res['session']}`"
+                    status_note = (
+                        f"deleted ({res.get('session_auto_cleared_reason') or 'ephemeral'})"
+                        if res.get("session_deleted")
+                        else f"`{res['session']}`"
+                    )
                     out_text += f"\n\n---\n_Agentspace Session: {status_note} (Target: `{res['model']}`)_"
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "result": {
                         "content": [{"type": "text", "text": out_text}],
+                        "isError": False,
+                    },
+                }
+
+            elif name == "agentspace_finish_task":
+                fin_res = finish_task_sessions(
+                    session_tag=args["session_tag"],
+                    media_only=bool(args.get("media_only", True)),
+                    csesidx=args.get("csesidx", DEFAULT_CSESIDX),
+                )
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(fin_res, indent=2)}],
+                        "isError": False,
+                    },
+                }
+
+            elif name == "agentspace_cleanup_media_sessions":
+                clean_res = cleanup_media_sessions(
+                    limit=int(args.get("limit", 50)),
+                    keep_latest=int(args.get("keep_latest", 0)),
+                    csesidx=args.get("csesidx", DEFAULT_CSESIDX),
+                )
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(clean_res, indent=2)}],
                         "isError": False,
                     },
                 }

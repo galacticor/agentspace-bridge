@@ -44,7 +44,17 @@ Use **IOH Agentspace** strictly for tasks that require **IOH enterprise data, IO
 ## 3. How the Agent Should Use Agentspace in This Workspace
 
 ### Session Lifecycle & `[agy-bridge]` Naming Rules
-- **Keep Sessions by Default:** Do **NOT** pass `--ephemeral` (`delete_session_after=True`) on normal queries. Keeping sessions allows multi-turn follow-ups and lets the user inspect or continue chats in the Agentspace Web UI.
+- **Keep Text/Data Sessions by Default:** Do **NOT** pass `--ephemeral` (`delete_session_after=True`) on normal Netra, Search, or Slides queries. Keeping sessions allows multi-turn follow-ups and lets the user inspect or continue chats in the Agentspace Web UI.
+- **Image & Video Generation Media Session Policy (1 Session per Task, Auto-Clear Every 3 Prompts, Delete on Task Finish):**
+  - **Scope (Pure AI Artwork / Video Generation Only — Never Data Visualization Charts):** This policy applies **strictly** to standalone Imagen/Veo artwork and video generation prompts. If a Netra, data analysis, or Python code-execution query produces a **visualization chart, plot, or graph image**, `agentspace_cli.py` still auto-downloads the `.png` chart locally, but **never** classifies or deletes that chat as a media-generator session.
+  - **Single Shared Media Session:** Always pass the **base** `--session-tag <first_8_chars_of_AGY_Conversation_ID>` (never append `_img1`, `_vid2`, etc., and never pass `--new-session` per image/video). `agentspace_cli.py` routes all media prompts in the task to a single shared `model:<model_id>:media` session slot.
+  - **Automatic 3-Prompt Rotation & Deletion (`--max-media-prompts 3`):** `agentspace_cli.py` tracks the media prompt count in `session_state.json`. Once the media session reaches **3 prompts** (default `DEFAULT_MAX_MEDIA_PROMPTS = 3`), `agentspace_cli.py` automatically downloads the generated `.png`/`.mp4` files and immediately **deletes** that media session so the next prompt starts clean with zero context bloat or Web UI clutter.
+  - **Mandatory Task/Subagent Teardown (`--finish-task`):** Whenever a subagent or main agent finishes a batch of image/video generation prompts (e.g., if only 1 or 2 prompts were left in the current cycle), it **MUST** run:
+    ```powershell
+    python agentspace_cli.py --finish-task <8_char_conv_id>
+    ```
+    *(or call `agentspace_finish_task(session_tag="<8_char_conv_id>")` via MCP)* to delete any remaining media session from the Agentspace Web UI while preserving Netra/Search/Slides sessions.
+  - **Bulk Media Clutter Sweep (`--cleanup-media-sessions`):** To sweep any orphaned image/video generation sessions across the Agentspace Web UI sidebar at any time, run `python agentspace_cli.py --cleanup-media-sessions`.
 - **Automatic `[agy-bridge]` Prefix:** Whenever a new session is created and kept, `agentspace_cli.py` automatically calls `widgetUpdateSession` (`updateMask: "displayName"`) to prefix the Web UI session title with **`[agy-bridge]`** (e.g., `[agy-bridge] Non-5G Device Subscribers`).
 - **Automatic Multi-Turn Continuity per Antigravity Chat:**
   - Always pass `--session-tag <first_8_chars_of_AGY_Conversation_ID>`.

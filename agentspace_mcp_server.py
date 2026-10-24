@@ -45,6 +45,7 @@ TOOLS = [
                         "Optional agent alias ('netra' for Netra Multi-Agent Coordinator 17783079275007264980, "
                         "'ace' for ACE Platform 8461818071814491910, 'office-workflow-suite' / 'slides' / 'pptx' for "
                         "Skill Agent 14950672669329422296, 'office-creator' for Office File Creator 17216682253898748109, "
+                        "'office-creator-2' / 'office2' for Office File Creator 2.0 2291045905737541211, "
                         "'agb' for 18420663427156982501, 'catalyst' for app_catalyst_agent) or raw numeric Agent ID."
                     ),
                 },

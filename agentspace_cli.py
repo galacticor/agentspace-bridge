@@ -15,6 +15,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,8 @@ AGENT_ALIASES: dict[str, str] = {
     "slides": "14950672669329422296",
     "pptx": "14950672669329422296",
     "office-creator": "17216682253898748109",
+    "office-creator-2": "2291045905737541211",
+    "office2": "2291045905737541211",
     "agb": "18420663427156982501",
     "catalyst": "app_catalyst_agent",
 }
@@ -61,6 +64,7 @@ SKILL_AGENT_IDS: dict[str, str] = {
 SLIDES_AGENT_IDS: set[str] = {
     "14950672669329422296",  # office-workflow-suite (SKILL_AGENT)
     "17216682253898748109",  # Office File Creator (LOW_CODE)
+    "2291045905737541211",   # Office File Creator 2.0 (LOW_CODE with Tricks 1 & 2)
 }
 
 
@@ -491,9 +495,32 @@ def _post_widget_rpc(
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 try:
                     raw = resp.read().decode("utf-8")
-                except http.client.IncompleteRead as ir:
-                    raw = ir.partial.decode("utf-8", errors="replace")
-                return (json.loads(raw) if raw.strip() else {}), xsrf_path
+                except (http.client.IncompleteRead, TimeoutError, socket.timeout) as ir:
+                    raw = getattr(ir, "partial", b"").decode("utf-8", errors="replace")
+                if not raw.strip():
+                    return {}, xsrf_path
+                try:
+                    return json.loads(raw), xsrf_path
+                except json.JSONDecodeError:
+                    # Salvage complete JSON objects from partial stream array
+                    salvaged = []
+                    decoder = json.JSONDecoder()
+                    idx = 0
+                    n = len(raw)
+                    while idx < n:
+                        while idx < n and raw[idx] in " \t\r\n,[]":
+                            idx += 1
+                        if idx >= n:
+                            break
+                        try:
+                            obj, next_idx = decoder.raw_decode(raw, idx)
+                            salvaged.append(obj)
+                            idx = next_idx
+                        except json.JSONDecodeError:
+                            break
+                    if salvaged:
+                        return salvaged, xsrf_path
+                    raise
         except urllib.error.HTTPError as e:
             if e.code in (401, 403) and auto_refresh and attempt == 0:
                 print(
@@ -929,10 +956,13 @@ def export_session_artifacts(
         all_texts: list[str] = [fallback_text] if fallback_text else []
         all_code_blocks: list[str] = []
         b64_pptx_payloads: list[str] = []
+        b64_office_payloads: list[tuple[str, str]] = []
         if fallback_text:
-            for m_b64 in re.findall(r"B64_PPTX:([A-Za-z0-9+/=]+)", fallback_text):
+            for fmt_tag, m_b64 in re.findall(r"B64_(PPTX|XLSX|DOCX):([A-Za-z0-9+/=]+)", fallback_text):
                 if len(m_b64) > 200:
-                    b64_pptx_payloads.append(m_b64)
+                    b64_office_payloads.append((fmt_tag.lower(), m_b64))
+                    if fmt_tag == "PPTX":
+                        b64_pptx_payloads.append(m_b64)
         sess_obj = sess_data.get("session", sess_data) if isinstance(sess_data, dict) else {}
         for turn in sess_obj.get("turns", []):
             ans_text = turn.get("detailedAssistAnswer", {}).get("answerText", "")
@@ -949,9 +979,11 @@ def export_session_artifacts(
                     all_texts.append(f"```python\n{exec_code}\n```")
                 code_out = gc_content.get("codeExecutionResult", {}).get("output", "")
                 if code_out:
-                    for m_b64 in re.findall(r"B64_PPTX:([A-Za-z0-9+/=]+)", code_out):
+                    for fmt_tag, m_b64 in re.findall(r"B64_(PPTX|XLSX|DOCX):([A-Za-z0-9+/=]+)", code_out):
                         if len(m_b64) > 200:
-                            b64_pptx_payloads.append(m_b64)
+                            b64_office_payloads.append((fmt_tag.lower(), m_b64))
+                            if fmt_tag == "PPTX":
+                                b64_pptx_payloads.append(m_b64)
 
         if output_dir:
             target_dir_nat = os.path.abspath(output_dir)
@@ -963,25 +995,33 @@ def export_session_artifacts(
         out_prefix_nat = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
         out_path_nat = os.path.join(target_dir_nat, f"{out_prefix_nat}{short_sess}__native_pptx.pptx")
 
-        if b64_pptx_payloads:
+        if b64_office_payloads:
             try:
                 os.makedirs(target_dir_nat, exist_ok=True)
-                raw_pptx = base64.b64decode(b64_pptx_payloads[-1])
-                with open(out_path_nat, "wb") as bf:
-                    bf.write(raw_pptx)
-                script_path_nat = os.path.splitext(out_path_nat)[0] + "_builder.py"
+                fmt_ext, last_b64 = b64_office_payloads[-1]
+                out_path_fmt = os.path.join(target_dir_nat, f"{out_prefix_nat}{short_sess}__native_{fmt_ext}.{fmt_ext}")
+                raw_bytes = base64.b64decode(last_b64)
+                with open(out_path_fmt, "wb") as bf:
+                    bf.write(raw_bytes)
+                script_path_nat = os.path.splitext(out_path_fmt)[0] + "_builder.py"
                 if all_code_blocks:
                     with open(script_path_nat, "w", encoding="utf-8") as sf:
                         sf.write(all_code_blocks[-1])
-                from pptx import Presentation as _PrsCheck
-                slides_cnt = len(_PrsCheck(out_path_nat).slides)
+                items_cnt = 1
+                if fmt_ext == "pptx":
+                    from pptx import Presentation as _PrsCheck
+                    items_cnt = len(_PrsCheck(out_path_fmt).slides)
+                elif fmt_ext == "xlsx":
+                    import zipfile
+                    with zipfile.ZipFile(out_path_fmt, "r") as zf:
+                        items_cnt = sum(1 for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
                 native_lxml_exported = {
-                    "path": out_path_nat,
-                    "bytes": len(raw_pptx),
+                    "path": out_path_fmt,
+                    "bytes": len(raw_bytes),
                     "script_path": script_path_nat if all_code_blocks else None,
-                    "slides_count": slides_cnt,
-                    "compiler": "agentspace_bard_python_interpreter_lxml",
-                    "mime_type": EXPORT_MIME_TYPES["pptx"],
+                    "slides_count": items_cnt,
+                    "compiler": f"agentspace_bard_python_interpreter_{fmt_ext}",
+                    "mime_type": EXPORT_MIME_TYPES.get(fmt_ext, "application/octet-stream"),
                 }
             except Exception:
                 native_lxml_exported = None
@@ -1542,10 +1582,17 @@ def ask_agentspace(
                 f"Section 7C `/home/bard` `pptx_lxml_wrapper` instructions, execute in `file_and_coding_agent`, and output the runnable Python script):\n\n{full_prompt}"
             )
         else:
+            import pptx_lxml_wrapper
+
+            wrapper_hint = (
+                f"\n\n### Reference `pptx_lxml_wrapper` + `run_visual_qa()` Implementation (Put the entire wrapper + all slides + `prs.save()` in ONE SINGLE Python block in `file_and_coding_agent`, then upload via `onedrive_agent__upload_file` with `HasBytes=True`):\n{pptx_lxml_wrapper.PYTHON_PPTX_PROMPT_PREFIX}"
+                if any(k in full_prompt.lower() for k in ("pptx", "slide", "presentation", "onedrive")) and not reused_existing_session
+                else ""
+            )
             full_prompt = (
                 f"{mention_pill} First call `load_skill` for `{skill_name}` (and any relevant reference files via `load_skill_resource`, "
                 f"such as `references/executive-slides.md` and `references/minimal-slides.md`), then follow its instructions "
-                f"to fulfill this request:\n\n{full_prompt}"
+                f"to fulfill this request:\n\n{full_prompt}{wrapper_hint}"
             )
 
     attached_files: list[str] = []
@@ -1618,7 +1665,7 @@ def ask_agentspace(
         "streamAssistRequest": stream_req,
     }
 
-    timeout_sec = 300
+    timeout_sec = 480
     chunks: list | dict = []
     xsrf_path = ""
     for rpc_try in range(4):
@@ -1661,10 +1708,50 @@ def ask_agentspace(
             if ans.get("name"):
                 last_answer_name = ans["name"]
             for rep in ans.get("replies", []):
-                if "actionInvocation" in rep and rep["actionInvocation"].get("actionConfirmationRequired"):
+                if "actionInvocation" in rep and rep["actionInvocation"].get("invocationId"):
                     pending_action = rep["actionInvocation"]
+        if not pending_action and curr_sess and _confirm_step == 0:
+            try:
+                sess_check, _ = _post_widget_rpc(
+                    "widgetGetSession",
+                    {
+                        "configId": WIDGET_CONFIG_ID,
+                        "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+                        "getSessionRequest": {
+                            "name": normalize_session_id(curr_sess),
+                            "includeAnswerDetails": True,
+                        },
+                    },
+                    csesidx=csesidx,
+                )
+                turns = sess_check.get("session", {}).get("turns", []) if isinstance(sess_check, dict) else []
+                if turns:
+                    lturn = turns[-1]
+                    if lturn.get("assistAnswer"):
+                        last_answer_name = lturn["assistAnswer"]
+                    lreps = lturn.get("detailedAssistAnswer", {}).get("replies", [])
+                    if lreps and "actionInvocation" in lreps[-1]:
+                        pending_action = lreps[-1]["actionInvocation"]
+            except Exception:
+                pass
         if not pending_action or not curr_sess:
             break
+        action_args = dict(pending_action.get("args", {}) or {})
+        if pending_action.get("actionName") == "onedrive_agent__upload_file":
+            action_args.setdefault("driveId", "<YOUR_ONEDRIVE_DRIVE_ID>")
+            action_args.setdefault("DriveName", "OneDrive - Indosat Ooredoo Hutchison")
+            action_args.setdefault("ParentId", "<onedrive_folder_id>")
+            action_args.setdefault("ParentName", "Agentspace_Exports")
+            action_args.setdefault("FileName", "presentation.pptx")
+            action_args.setdefault("InputFileName", action_args["FileName"])
+            if str(action_args.get("InputFileName", "")).endswith(".txt") and not action_args.get("ContentBytes"):
+                action_args["HasBytes"] = False
+                action_args["ContentBytes"] = ""
+            else:
+                action_args["HasBytes"] = True
+                raw_b64_matches = re.findall(r"B64_(?:PPTX|XLSX|DOCX):([A-Za-z0-9+/=]{200,})", json.dumps(chunks))
+                if raw_b64_matches:
+                    action_args["ContentBytes"] = raw_b64_matches[-1]
         confirm_req = {
             "session": curr_sess,
             "query": {"parts": [{"text": "Action Confirmed"}]},
@@ -1676,7 +1763,7 @@ def ask_agentspace(
                 "actionName": pending_action.get("actionName", ""),
                 "actionInvocationId": pending_action.get("invocationId", ""),
                 "assistAnswerName": last_answer_name,
-                "args": pending_action.get("args", {}),
+                "args": action_args,
             },
         }
         if "agentsSpec" in stream_req:
@@ -1744,7 +1831,7 @@ def ask_agentspace(
                         text_parts.append(f"\n```python\n{exec_c}\n```\n")
                 if "codeExecutionResult" in content:
                     c_out = content["codeExecutionResult"].get("output", "")
-                    if "B64_PPTX:" in c_out:
+                    if any(k in c_out for k in ("B64_PPTX:", "B64_XLSX:", "B64_DOCX:", "[QA_GATE_PASSED]")):
                         text_parts.append(f"\n{c_out}\n")
                 if content.get("thought"):
                     if "text" in content:

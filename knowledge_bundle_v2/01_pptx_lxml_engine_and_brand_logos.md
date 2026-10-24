@@ -134,10 +134,8 @@ class _Prs:
         if os.path.isdir("/home/bard"):
             with open("/home/bard/pptx_payload.txt", "wb") as f_txt2:
                 f_txt2.write(raw_pptx)
-        b64_str = base64.b64encode(raw_pptx).decode("ascii")
         print(f"[PPTX_PAYLOAD_ATTACHED] Wrote {len(raw_pptx)} raw binary bytes to pptx_payload.txt (use InputFileName='pptx_payload.txt', HasBytes=false, ContentBytes='')")
-        print("B64_PPTX:" + b64_str)
-        return b64_str
+        return f"pptx_payload.txt ({len(raw_pptx)} bytes)"
 
 def create_widescreen_prs(): return _Prs()
 def zero_tf_margins(tf, wrap=True, anchor="t"): return tf
@@ -246,7 +244,7 @@ def add_tufte_table(slide, x, y, w, h, headers, rows, col_widths=None, num_cols=
             ln = etree.SubElement(tcPr, f"{{{A_NS}}}{tg}", w=str(int(pt*12700)))
             if cl: etree.SubElement(etree.SubElement(ln, f"{{{A_NS}}}solidFill"), f"{{{A_NS}}}srgbClr", val=_hex(cl))
             else: etree.SubElement(ln, f"{{{A_NS}}}noFill")
-        etree.SubElement(etree.SubElement(tcPr, f"{{{A_NS}}}solidFill"), f"{{{A_NS}}}srgbClr", val=_hex(bg))
+        sf = etree.SubElement(tcPr, f"{{{A_NS}}}solidFill"); etree.SubElement(sf, f"{{{A_NS}}}srgbClr", val=_hex(bg))
     htr = etree.SubElement(tbl, f"{{{A_NS}}}tr", h=str(rh))
     for ci, htxt in enumerate(headers): _c(htr, htxt, True, header_fg, header_bg, "r" if ci in num_cols else "l", "0F172A", 1.5, "0F172A", 1.5, FONT_HEAD)
     for ri, rvals in enumerate(rows):

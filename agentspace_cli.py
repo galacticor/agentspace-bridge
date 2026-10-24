@@ -1026,28 +1026,7 @@ def export_session_artifacts(
             except Exception:
                 native_lxml_exported = None
 
-        combined_turn_text = "\n\n".join(all_texts)
-        if not native_lxml_exported and ("create_widescreen_prs" in combined_turn_text or "from pptx" in combined_turn_text):
-            try:
-                import pptx_lxml_wrapper
-
-                os.makedirs(target_dir_nat, exist_ok=True)
-                lxml_res = pptx_lxml_wrapper.compile_python_pptx_from_response(
-                    response_text=combined_turn_text,
-                    out_pptx_path=out_path_nat,
-                )
-                native_lxml_exported = {
-                    "path": lxml_res["pptx_path"],
-                    "bytes": lxml_res["bytes"],
-                    "script_path": lxml_res["script_path"],
-                    "slides_count": lxml_res["slides_count"],
-                    "mime_type": EXPORT_MIME_TYPES["pptx"],
-                }
-            except Exception as nat_err:
-                if not artifact_ids:
-                    raise RuntimeError(f"Failed to compile native python-pptx script in session {short_sess}: {nat_err}") from nat_err
-
-        if not native_lxml_exported and not artifact_ids and short_sess:
+        if not native_lxml_exported and short_sess:
             try:
                 dl_media = download_session_media_files(
                     session_id=short_sess,
@@ -1079,6 +1058,27 @@ def export_session_artifacts(
                     }
             except Exception:
                 pass
+
+        combined_turn_text = "\n\n".join(all_texts)
+        if not native_lxml_exported and ("create_widescreen_prs" in combined_turn_text or "from pptx" in combined_turn_text):
+            try:
+                import pptx_lxml_wrapper
+
+                os.makedirs(target_dir_nat, exist_ok=True)
+                lxml_res = pptx_lxml_wrapper.compile_python_pptx_from_response(
+                    response_text=combined_turn_text,
+                    out_pptx_path=out_path_nat,
+                )
+                native_lxml_exported = {
+                    "path": lxml_res["pptx_path"],
+                    "bytes": lxml_res["bytes"],
+                    "script_path": lxml_res["script_path"],
+                    "slides_count": lxml_res["slides_count"],
+                    "mime_type": EXPORT_MIME_TYPES["pptx"],
+                }
+            except Exception as nat_err:
+                if not artifact_ids:
+                    raise RuntimeError(f"Failed to compile native python-pptx script in session {short_sess}: {nat_err}") from nat_err
 
     if not artifact_ids:
         if native_lxml_exported:
@@ -1578,21 +1578,11 @@ def ask_agentspace(
         mention_pill = f"[{skill_name}](mention://?uri={resolved_agent})"
         if python_pptx:
             full_prompt = (
-                f"{mention_pill} First call `load_skill` for `{skill_name}` (do NOT call `save_slides_to_artifact`—instead follow "
-                f"Section 7C `/home/bard` `pptx_lxml_wrapper` instructions, execute in `file_and_coding_agent`, and output the runnable Python script):\n\n{full_prompt}"
+                f"{mention_pill} First call `load_skill` for `{skill_name}` and follow its V2.0 instructions:\n\n{full_prompt}"
             )
         else:
-            import pptx_lxml_wrapper
-
-            wrapper_hint = (
-                f"\n\n### Reference `pptx_lxml_wrapper` + `run_visual_qa()` Implementation (Put the entire wrapper + all slides + `prs.save()` in ONE SINGLE Python block in `file_and_coding_agent`, then upload via `onedrive_agent__upload_file` with `HasBytes=True`):\n{pptx_lxml_wrapper.PYTHON_PPTX_PROMPT_PREFIX}"
-                if any(k in full_prompt.lower() for k in ("pptx", "slide", "presentation", "onedrive")) and not reused_existing_session
-                else ""
-            )
             full_prompt = (
-                f"{mention_pill} First call `load_skill` for `{skill_name}` (and any relevant reference files via `load_skill_resource`, "
-                f"such as `references/executive-slides.md` and `references/minimal-slides.md`), then follow its instructions "
-                f"to fulfill this request:\n\n{full_prompt}{wrapper_hint}"
+                f"{mention_pill} {full_prompt}"
             )
 
     attached_files: list[str] = []

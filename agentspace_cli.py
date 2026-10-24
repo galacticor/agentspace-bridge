@@ -552,6 +552,47 @@ def delete_session(session_id: str, csesidx: str = DEFAULT_CSESIDX) -> dict:
 
 
 SESSION_PREFIX = "[agy-bridge]"
+DEFAULT_MAX_MEDIA_PROMPTS = int(os.environ.get("AGENTSPACE_MAX_MEDIA_PROMPTS", "3"))
+
+_MEDIA_PROMPT_RE = re.compile(
+    r"(?:^\s*(?:generate|create|render|make|draw|produce)\s+(?:an?\s+)?(?:short\s+|cinematic\s+|realistic\s+|3d\s+|10-second\s+|8-second\s+)*"
+    r"(?:image|video|animation|illustration|picture|photo|clip)\b|"
+    r"\b(?:generate\s+an?\s+image|generate\s+a\s+video|create\s+an?\s+image|create\s+a\s+(?:short\s+|cinematic\s+|realistic\s+|10-second\s+|8-second\s+)*video)\b)",
+    re.IGNORECASE,
+)
+
+# Data visualization / chart / plot / diagram terms that must NEVER be treated as AI image/video generator sessions
+_DATA_VIZ_EXCLUDE_RE = re.compile(
+    r"\b(?:chart|charts|plot|plots|graph|graphs|visualization|visualisation|histogram|heatmap|scatter|"
+    r"bar\s+chart|line\s+chart|pie\s+chart|dashboard|table|sql|query|bigquery|netra|arpu|revenue|cohort|"
+    r"pptx|slide|slides|presentation|deck|matplotlib|seaborn|plotly|dataframe|csv|xlsx|excel)\b",
+    re.IGNORECASE,
+)
+
+
+def is_media_generation_prompt(prompt: str) -> bool:
+    """
+    Detects whether a prompt is purely an AI image/artwork or video generation request
+    (Imagen / Veo), while explicitly excluding data visualization, chart, plot, or analytical requests.
+    """
+    if not prompt:
+        return False
+    head = prompt.strip()[:350]
+    if _DATA_VIZ_EXCLUDE_RE.search(head):
+        return False
+    return bool(_MEDIA_PROMPT_RE.search(head))
+
+
+def _normalize_media_base_tag(session_tag: str | None) -> str | None:
+    """
+    Strips per-asset suffixes like `_img1`, `_vid2`, `_scene3`, `_asset4` from a session_tag
+    so that multiple media calls in the same task share a single media session slot and counter.
+    """
+    if not session_tag:
+        return None
+    cleaned = session_tag.strip()
+    cleaned = re.sub(r"_(?:img|vid|video|image|scene|shot|asset|cutout|clip)_?\d+$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned or session_tag
 
 
 def ensure_session_prefix(
@@ -617,29 +658,16 @@ def _get_session_state_path(session_tag: str | None) -> str | None:
     return os.path.join(session_dir, "session_state.json")
 
 
-def get_reusable_session(session_tag: str | None, mode_key: str) -> str | None:
+def _load_session_state(session_tag: str | None) -> tuple[dict, str | None]:
     state_path = _get_session_state_path(session_tag)
-    if not state_path or not os.path.isfile(state_path):
-        return None
-    try:
-        with open(state_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        return state.get("sessions", {}).get(mode_key)
-    except Exception:
-        return None
-
-
-def save_reusable_session(
-    session_tag: str | None,
-    mode_key: str,
-    session_name: str,
-    display_name: str | None = None,
-) -> None:
-    state_path = _get_session_state_path(session_tag)
-    if not state_path or not session_name:
-        return
-    state: dict = {"session_tag": session_tag, "sessions": {}, "history": []}
-    if os.path.isfile(state_path):
+    state: dict = {
+        "session_tag": session_tag,
+        "sessions": {},
+        "prompt_counts": {},
+        "media_sessions": [],
+        "history": [],
+    }
+    if state_path and os.path.isfile(state_path):
         try:
             with open(state_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
@@ -647,14 +675,240 @@ def save_reusable_session(
                     state.update(loaded)
         except Exception:
             pass
-    if "sessions" not in state or not isinstance(state["sessions"], dict):
+    if not isinstance(state.get("sessions"), dict):
         state["sessions"] = {}
+    if not isinstance(state.get("prompt_counts"), dict):
+        state["prompt_counts"] = {}
+    if not isinstance(state.get("media_sessions"), list):
+        state["media_sessions"] = []
+    if not isinstance(state.get("history"), list):
+        state["history"] = []
+    return state, state_path
+
+
+def get_reusable_session(session_tag: str | None, mode_key: str) -> str | None:
+    state, _ = _load_session_state(session_tag)
+    return state.get("sessions", {}).get(mode_key)
+
+
+def get_session_prompt_count(session_tag: str | None, mode_key: str) -> int:
+    state, _ = _load_session_state(session_tag)
+    try:
+        return int(state.get("prompt_counts", {}).get(mode_key, 0))
+    except Exception:
+        return 0
+
+
+def clear_reusable_session(
+    session_tag: str | None,
+    mode_key: str,
+    deleted_session_id: str | None = None,
+) -> None:
+    state, state_path = _load_session_state(session_tag)
+    if not state_path:
+        return
+    state["sessions"].pop(mode_key, None)
+    state["prompt_counts"].pop(mode_key, None)
+    if deleted_session_id:
+        short_del = normalize_session_id(deleted_session_id)
+        state["media_sessions"] = [
+            s for s in state.get("media_sessions", []) if normalize_session_id(s) != short_del
+        ]
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def save_reusable_session(
+    session_tag: str | None,
+    mode_key: str,
+    session_name: str,
+    display_name: str | None = None,
+    prompt_count: int | None = None,
+    is_media: bool = False,
+) -> int:
+    state, state_path = _load_session_state(session_tag)
+    if not state_path or not session_name:
+        return 0
+    prev_sess = state["sessions"].get(mode_key)
+    short_new = normalize_session_id(session_name)
+    short_prev = normalize_session_id(prev_sess) if prev_sess else None
+
+    if prompt_count is not None:
+        new_count = prompt_count
+    elif short_prev == short_new:
+        new_count = int(state["prompt_counts"].get(mode_key, 0)) + 1
+    else:
+        new_count = 1
+
     state["sessions"][mode_key] = session_name
+    state["prompt_counts"][mode_key] = new_count
+    if is_media or ":media" in mode_key:
+        if short_new not in [normalize_session_id(x) for x in state["media_sessions"]]:
+            state["media_sessions"].append(short_new)
+    if short_new not in [normalize_session_id(x) for x in state["history"]]:
+        state["history"].append(short_new)
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if display_name:
         state["last_display_name"] = display_name
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+    return new_count
+
+
+def finish_task_sessions(
+    session_tag: str,
+    media_only: bool = True,
+    csesidx: str = DEFAULT_CSESIDX,
+) -> dict:
+    """
+    Cleans up and deletes tracked Agentspace sessions for a finished subagent or task (`--finish-task`).
+    Also sweeps any sibling `<session_tag>_img*` / `<session_tag>_vid*` folders in `./outputs/`.
+    By default (`media_only=True`), deletes all media sessions (and any single-asset sub-tags)
+    while preserving main Netra/Search/Slides sessions unless `media_only=False`.
+    """
+    base_tag = _normalize_media_base_tag(session_tag) or session_tag
+    clean_base = _sanitize_slug(base_tag, max_len=24)
+    if not clean_base.startswith("chat_"):
+        clean_base = f"chat_{clean_base}"
+
+    candidate_dirs: list[str] = []
+    if os.path.isdir(OUTPUTS_DIR):
+        for entry in sorted(os.listdir(OUTPUTS_DIR)):
+            if entry == clean_base or entry.startswith(f"{clean_base}_"):
+                full_d = os.path.join(OUTPUTS_DIR, entry)
+                if os.path.isdir(full_d):
+                    candidate_dirs.append(full_d)
+
+    sessions_to_delete: list[str] = []
+    state_files_touched: list[str] = []
+
+    for d_path in candidate_dirs:
+        st_file = os.path.join(d_path, "session_state.json")
+        is_sub_asset_dir = os.path.basename(d_path) != clean_base
+        if os.path.isfile(st_file):
+            try:
+                with open(st_file, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+            except Exception:
+                st = {}
+            sess_map = st.get("sessions", {}) if isinstance(st.get("sessions"), dict) else {}
+            media_list = st.get("media_sessions", []) if isinstance(st.get("media_sessions"), list) else []
+
+            for m_sess in media_list:
+                short_id = normalize_session_id(m_sess)
+                if short_id and short_id not in sessions_to_delete:
+                    sessions_to_delete.append(short_id)
+
+            for m_key, s_val in list(sess_map.items()):
+                if not s_val:
+                    continue
+                if (not media_only) or (":media" in m_key) or is_sub_asset_dir:
+                    short_id = normalize_session_id(s_val)
+                    if short_id and short_id not in sessions_to_delete:
+                        sessions_to_delete.append(short_id)
+                    sess_map.pop(m_key, None)
+                    if isinstance(st.get("prompt_counts"), dict):
+                        st["prompt_counts"].pop(m_key, None)
+
+            st["media_sessions"] = []
+            st["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            try:
+                with open(st_file, "w", encoding="utf-8") as f:
+                    json.dump(st, f, indent=2)
+                state_files_touched.append(st_file)
+            except Exception:
+                pass
+
+        # Also check filenames in sub-asset folders (`chat_<tag>_img1__<ts>__<short_id>__...`)
+        if is_sub_asset_dir:
+            for fname in os.listdir(d_path):
+                m_fn = re.match(r"^chat_[a-z0-9_]+__\d{8}_\d{6}__([0-9]{6,22})__", fname)
+                if m_fn:
+                    cand_prefix = m_fn.group(1)
+                    if len(cand_prefix) >= 12 and cand_prefix not in sessions_to_delete:
+                        sessions_to_delete.append(cand_prefix)
+
+    deleted_ids: list[str] = []
+    already_deleted_ids: list[str] = []
+    failed_ids: list[dict] = []
+    for sid in sessions_to_delete:
+        try:
+            delete_session(sid, csesidx=csesidx)
+            deleted_ids.append(sid)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                already_deleted_ids.append(sid)
+            else:
+                failed_ids.append({"session_id": sid, "error": str(exc)})
+        except Exception as exc:
+            if "404" in str(exc):
+                already_deleted_ids.append(sid)
+            else:
+                failed_ids.append({"session_id": sid, "error": str(exc)})
+
+    return {
+        "base_session_tag": base_tag,
+        "media_only": media_only,
+        "deleted_sessions": deleted_ids,
+        "already_deleted_sessions": already_deleted_ids,
+        "deleted_count": len(deleted_ids),
+        "failed": failed_ids,
+        "state_files_updated": state_files_touched,
+    }
+
+
+def cleanup_media_sessions(
+    limit: int = 50,
+    keep_latest: int = 0,
+    csesidx: str = DEFAULT_CSESIDX,
+) -> dict:
+    """
+    Scans recent Agentspace sessions via `list_sessions` and deletes sessions that were created
+    for image or video generation (matching media prompts or known media titles).
+    """
+    sessions = list_sessions(limit=limit, csesidx=csesidx)
+    matched_media: list[dict] = []
+    title_media_re = re.compile(
+        r"(?:\b(?:video|animation|image|helix\s+art|wave\s+art|celestial\s+observatory|cosmic\s+emblems|cosmic\s+hall|nautilus\s+shell)\b)",
+        re.IGNORECASE,
+    )
+    for s in sessions:
+        if s.get("mode") == "AGENT":
+            continue
+        fq = (s.get("first_query") or "").strip()
+        dn = (s.get("display_name") or "").strip()
+        if _DATA_VIZ_EXCLUDE_RE.search(fq) or _DATA_VIZ_EXCLUDE_RE.search(dn):
+            continue
+        if is_media_generation_prompt(fq) or is_media_generation_prompt(dn) or bool(title_media_re.search(dn)):
+            # Never accidentally delete PPTX / Netra / OneDrive / outline planning / chart sessions
+            if any(k in fq.lower() or k in dn.lower() for k in ("pptx", "slide", "onedrive", "netra", "series plan", "chart", "plot", "visualization")):
+                continue
+            matched_media.append(s)
+
+    to_delete = matched_media[keep_latest:] if keep_latest > 0 else matched_media
+    deleted: list[dict] = []
+    errors: list[dict] = []
+    for s in to_delete:
+        sid = s["session_id"]
+        try:
+            delete_session(sid, csesidx=csesidx)
+            deleted.append({
+                "session_id": sid,
+                "display_name": s.get("display_name"),
+                "first_query": s.get("first_query"),
+            })
+        except Exception as exc:
+            errors.append({"session_id": sid, "error": str(exc)})
+
+    return {
+        "scanned": len(sessions),
+        "matched_media_sessions": len(matched_media),
+        "kept_latest": keep_latest,
+        "deleted_count": len(deleted),
+        "deleted": deleted,
+        "errors": errors,
+    }
 
 
 def list_sessions(limit: int = 20, csesidx: str = DEFAULT_CSESIDX) -> list[dict]:
@@ -1542,29 +1796,51 @@ def ask_agentspace(
     session_tag: str | None = None,
     new_session: bool = False,
     python_pptx: bool = False,
+    max_media_prompts: int = DEFAULT_MAX_MEDIA_PROMPTS,
     csesidx: str = DEFAULT_CSESIDX,
 ) -> dict:
     if python_pptx and not agent:
         agent = "office-workflow-suite"
     resolved_agent = resolve_agent_id(agent)
     skill_name = SKILL_AGENT_IDS.get(resolved_agent) if resolved_agent else None
+    is_media_prompt = (not resolved_agent and not skill_name and is_media_generation_prompt(prompt))
+    effective_state_tag = _normalize_media_base_tag(session_tag) if is_media_prompt else session_tag
     mode_key = (
         f"skill:{skill_name}:lxml"
         if (skill_name and python_pptx)
         else (
             f"skill:{skill_name}"
             if skill_name
-            else (f"agent:{resolved_agent}" if resolved_agent else f"model:{model_id}:search={int(bool(enable_search))}")
+            else (
+                f"agent:{resolved_agent}"
+                if resolved_agent
+                else (
+                    f"model:{model_id}:media"
+                    if is_media_prompt
+                    else f"model:{model_id}:search={int(bool(enable_search))}"
+                )
+            )
         )
     )
 
     effective_session = session
     reused_existing_session = False
-    if not effective_session and session_tag and not new_session and not delete_session_after:
-        cached_sess = get_reusable_session(session_tag, mode_key)
+    rotated_previous_media_session: str | None = None
+    if not effective_session and effective_state_tag and not new_session and not delete_session_after:
+        cached_sess = get_reusable_session(effective_state_tag, mode_key)
         if cached_sess:
-            effective_session = format_delete_session_name(cached_sess)
-            reused_existing_session = True
+            prev_count = get_session_prompt_count(effective_state_tag, mode_key)
+            if is_media_prompt and max_media_prompts > 0 and prev_count >= max_media_prompts:
+                try:
+                    delete_session(cached_sess, csesidx=csesidx)
+                    rotated_previous_media_session = normalize_session_id(cached_sess)
+                except Exception:
+                    pass
+                clear_reusable_session(effective_state_tag, mode_key, deleted_session_id=cached_sess)
+                cached_sess = None
+            if cached_sess:
+                effective_session = format_delete_session_name(cached_sess)
+                reused_existing_session = True
     elif effective_session:
         effective_session = format_delete_session_name(effective_session)
         reused_existing_session = True
@@ -1844,11 +2120,22 @@ def ask_agentspace(
             generated_media = []
 
     session_deleted = False
+    session_auto_cleared_reason = None
+    media_prompt_count = 0
     display_name = None
+    has_video_media = any(m.get("media_type") == "video" for m in generated_media)
+    # Only treat as an AI image/video generator session if the prompt itself is a pure media generation prompt
+    # (never if an analytical/Netra/chart/code-execution query produced a visualization chart image)
+    is_media_turn = bool(
+        not resolved_agent
+        and not skill_name
+        and (is_media_prompt or (has_video_media and not _DATA_VIZ_EXCLUDE_RE.search(prompt or "")))
+    )
     if delete_session_after and session_name:
         try:
             delete_session(session_name, csesidx=csesidx)
             session_deleted = True
+            session_auto_cleared_reason = "ephemeral"
         except Exception:
             session_deleted = False
     elif session_name:
@@ -1859,13 +2146,32 @@ def ask_agentspace(
                 prefix=SESSION_PREFIX,
                 csesidx=csesidx,
             )
-        if session_tag:
-            save_reusable_session(
-                session_tag=session_tag,
-                mode_key=mode_key,
+        state_tag_to_save = (_normalize_media_base_tag(session_tag) if is_media_turn else session_tag) or session_tag
+        save_mode_key = (
+            f"model:{model_id}:media"
+            if (is_media_turn and not resolved_agent and not skill_name)
+            else mode_key
+        )
+        if state_tag_to_save:
+            media_prompt_count = save_reusable_session(
+                session_tag=state_tag_to_save,
+                mode_key=save_mode_key,
                 session_name=session_name,
                 display_name=display_name,
+                is_media=is_media_turn,
             )
+            if is_media_turn and max_media_prompts > 0 and media_prompt_count >= max_media_prompts:
+                try:
+                    delete_session(session_name, csesidx=csesidx)
+                    session_deleted = True
+                    session_auto_cleared_reason = f"media_quota_reached ({media_prompt_count}/{max_media_prompts})"
+                    clear_reusable_session(
+                        state_tag_to_save,
+                        save_mode_key,
+                        deleted_session_id=session_name,
+                    )
+                except Exception:
+                    pass
 
     final_text = "".join(text_parts).strip()
     saved_output_path = None
@@ -1938,6 +2244,9 @@ def ask_agentspace(
         "session_reused": reused_existing_session,
         "session_display_name": display_name,
         "session_deleted": session_deleted,
+        "session_auto_cleared_reason": session_auto_cleared_reason,
+        "rotated_previous_media_session": rotated_previous_media_session,
+        "media_prompt_count": media_prompt_count if is_media_turn else None,
         "agent": resolved_agent,
         "model": model_id if not resolved_agent else f"agent:{resolved_agent}",
         "attached_files": attached_files,
@@ -2031,6 +2340,36 @@ def main():
         default=None,
         metavar="SESSION_ID",
         help="Delete a specific chat session by ID or full resource name and exit",
+    )
+    parser.add_argument(
+        "--finish-task",
+        nargs="?",
+        const="AUTO",
+        default=None,
+        metavar="SESSION_TAG",
+        help="Delete tracked media sessions (and any _img*/_vid* sub-sessions) for a finished subagent/task (--session-tag) and exit",
+    )
+    parser.add_argument(
+        "--finish-all-sessions",
+        action="store_true",
+        help="When used with --finish-task, delete all tracked sessions for that tag (not just media sessions)",
+    )
+    parser.add_argument(
+        "--cleanup-media-sessions",
+        action="store_true",
+        help="Scan recent Agentspace sessions and delete image/video generation chat sessions to declutter the Web UI",
+    )
+    parser.add_argument(
+        "--keep-latest-media",
+        type=int,
+        default=0,
+        help="Number of most recent media sessions to keep when running --cleanup-media-sessions (default: 0)",
+    )
+    parser.add_argument(
+        "--max-media-prompts",
+        type=int,
+        default=DEFAULT_MAX_MEDIA_PROMPTS,
+        help=f"Auto-clear/rotate media generation session after N prompts (default: {DEFAULT_MAX_MEDIA_PROMPTS}; 0 disables auto-clear)",
     )
     parser.add_argument(
         "--export-slides",
@@ -2209,6 +2548,47 @@ def main():
                 print(f"Deleted session: {res['session_id']}")
             return
 
+        if args.finish_task:
+            target_tag = args.session_tag if args.finish_task == "AUTO" else args.finish_task
+            if not target_tag:
+                parser.error("--finish-task requires either a SESSION_TAG argument or --session-tag.")
+            fin_res = finish_task_sessions(
+                session_tag=target_tag,
+                media_only=not args.finish_all_sessions,
+                csesidx=args.csesidx,
+            )
+            if args.json:
+                print(json.dumps(fin_res, indent=2))
+            else:
+                print(
+                    f"Finished task cleanup for tag '{fin_res['base_session_tag']}' "
+                    f"(media_only={fin_res['media_only']}): deleted {fin_res['deleted_count']} session(s)."
+                )
+                for sid in fin_res["deleted_sessions"]:
+                    print(f"  - Deleted session: {sid}")
+                for fail in fin_res["failed"]:
+                    print(f"  - Failed ({fail['session_id']}): {fail['error']}", file=sys.stderr)
+            return
+
+        if args.cleanup_media_sessions:
+            clean_res = cleanup_media_sessions(
+                limit=max(args.limit, 50),
+                keep_latest=args.keep_latest_media,
+                csesidx=args.csesidx,
+            )
+            if args.json:
+                print(json.dumps(clean_res, indent=2))
+            else:
+                print(
+                    f"Media session cleanup: scanned {clean_res['scanned']} session(s), "
+                    f"matched {clean_res['matched_media_sessions']}, deleted {clean_res['deleted_count']}."
+                )
+                for d in clean_res["deleted"]:
+                    print(f"  - Deleted [{d['session_id']}] {d.get('display_name') or d.get('first_query')}")
+                for err in clean_res["errors"]:
+                    print(f"  - Error [{err['session_id']}]: {err['error']}", file=sys.stderr)
+            return
+
         if args.download_media and not args.prompt:
             dl_files = download_session_media_files(
                 session_id=args.download_media,
@@ -2244,7 +2624,10 @@ def main():
             return
 
         if not args.prompt:
-            parser.error("A prompt is required unless --list-sessions, --delete-session, --export-slides, or --download-media is specified.")
+            parser.error(
+                "A prompt is required unless --list-sessions, --delete-session, --finish-task, "
+                "--cleanup-media-sessions, --export-slides, or --download-media is specified."
+            )
 
         use_native_pptx = bool(args.python_pptx or (args.pptx_mode and args.pptx_mode.lower() == "native"))
         if args.pptx_mode and args.pptx_mode.lower() == "default" and not args.agent:
@@ -2264,6 +2647,7 @@ def main():
             session_tag=args.session_tag,
             new_session=args.new_session,
             python_pptx=use_native_pptx,
+            max_media_prompts=args.max_media_prompts,
             csesidx=args.csesidx,
         )
         if args.json:
@@ -2285,11 +2669,25 @@ def main():
                     print(f"\n[python-pptx Compile Error: {exp['error']}]", file=sys.stderr)
                 for fmt_k, info in exp.get("exported_files", {}).items():
                     print(f"\n[Auto-Exported {fmt_k.upper()} ({exp.get('slides_count')} slides): {info['path']} ({info['bytes']:,} bytes)]")
+            if res.get("rotated_previous_media_session"):
+                print(
+                    f"\n[Media Session Rotated: deleted previous 3-prompt session {res['rotated_previous_media_session']}]",
+                    file=sys.stderr,
+                )
             if res.get("session_deleted"):
-                print(f"\n[Ephemeral mode: deleted temporary session {normalize_session_id(res['session'])}]", file=sys.stderr)
+                reason_str = res.get("session_auto_cleared_reason") or "ephemeral"
+                print(
+                    f"\n[Auto-Cleared Session ({reason_str}): deleted {normalize_session_id(res['session'])}]",
+                    file=sys.stderr,
+                )
             elif res.get("session"):
                 mode_note = "Continued" if res.get("session_reused") else f"Created ({res.get('session_display_name') or '[agy-bridge]'})"
-                print(f"\n[Agentspace Session {mode_note}: {normalize_session_id(res['session'])}]", file=sys.stderr)
+                quota_note = (
+                    f" [media prompt {res['media_prompt_count']}/{args.max_media_prompts}]"
+                    if res.get("media_prompt_count")
+                    else ""
+                )
+                print(f"\n[Agentspace Session {mode_note}{quota_note}: {normalize_session_id(res['session'])}]", file=sys.stderr)
         else:
             if res["text"]:
                 print(res["text"])
@@ -2301,11 +2699,25 @@ def main():
                 exp = res["exported_artifacts"]
                 for fmt_k, info in exp.get("exported_files", {}).items():
                     print(f"\n[Auto-Exported {fmt_k.upper()} ({exp.get('slides_count')} slides): {info['path']} ({info['bytes']:,} bytes)]", file=sys.stderr)
+            if res.get("rotated_previous_media_session"):
+                print(
+                    f"\n[Media Session Rotated: deleted previous 3-prompt session {res['rotated_previous_media_session']}]",
+                    file=sys.stderr,
+                )
             if res.get("session_deleted"):
-                print(f"\n[Ephemeral mode: deleted temporary session {normalize_session_id(res['session'])}]", file=sys.stderr)
+                reason_str = res.get("session_auto_cleared_reason") or "ephemeral"
+                print(
+                    f"\n[Auto-Cleared Session ({reason_str}): deleted {normalize_session_id(res['session'])}]",
+                    file=sys.stderr,
+                )
             elif res.get("session"):
                 mode_note = "Continued" if res.get("session_reused") else f"Created ({res.get('session_display_name') or '[agy-bridge]'})"
-                print(f"\n[Agentspace Session {mode_note}: {normalize_session_id(res['session'])}]", file=sys.stderr)
+                quota_note = (
+                    f" [media prompt {res['media_prompt_count']}/{args.max_media_prompts}]"
+                    if res.get("media_prompt_count")
+                    else ""
+                )
+                print(f"\n[Agentspace Session {mode_note}{quota_note}: {normalize_session_id(res['session'])}]", file=sys.stderr)
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
         print(f"HTTP {e.code} Error:\n{err_body}", file=sys.stderr)

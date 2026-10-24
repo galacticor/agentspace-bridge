@@ -29,7 +29,12 @@ This skill connects Antigravity to **IOH's Gemini Enterprise (Agentspace)** via 
 
 ## Session Naming, Continuity & Anti-Polling Rules
 
-- **Keep Sessions by Default:** Do **not** pass `--ephemeral` on normal queries. Keeping sessions allows multi-turn follow-ups and lets the user view the chat in the Agentspace Web UI.
+- **Keep Text/Data Sessions by Default:** Do **not** pass `--ephemeral` on normal Netra, Search, or Slides queries. Keeping sessions allows multi-turn follow-ups and lets the user view the chat in the Agentspace Web UI.
+- **Image & Video Generation Media Session Policy (1 Session per Task, Auto-Clear Every 3 Prompts, Delete on Task Finish):**
+  - **Scope (Pure AI Artwork / Video Generation Only — Never Data Visualization Charts):** This policy applies strictly to standalone Imagen/Veo artwork and video generation prompts. If an analytical, Netra, or Python code-execution query outputs a **visualization chart, plot, or graph `.png`**, `agentspace_cli.py` still auto-downloads the chart image locally, but **never** treats or deletes that session as a media-generator session.
+  - **Single Shared Media Session:** Always pass the **base** `--session-tag <first_8_chars_of_AGY_Conversation_ID>` (never append `_img1`, `_vid2`, etc., and never pass `--new-session` per image/video). `agentspace_cli.py` routes all media prompts in a task into a single `model:<model_id>:media` session slot.
+  - **Automatic 3-Prompt Rotation & Deletion (`--max-media-prompts 3`):** After every **3 media prompts** in that session, `agentspace_cli.py` automatically downloads the generated `.png`/`.mp4` files and immediately **deletes** the session so the next prompt starts clean without polluting the Agentspace Web UI sidebar.
+  - **Mandatory Task/Subagent Teardown (`--finish-task`):** Whenever a subagent or main agent finishes generating images/videos for a task, it **MUST** run `python "agentspace_cli.py" --finish-task <8_char_conv_id>` (or call `agentspace_finish_task(session_tag="<8_char_conv_id>")` via MCP) to delete any remaining open media session while preserving Netra/Search/Slides sessions.
 - **Automatic `[agy-bridge]` Prefix:** Every newly created session is automatically renamed via `widgetUpdateSession` so its Web UI title starts with **`[agy-bridge]`** (e.g., `[agy-bridge] Non-5G Device Subscribers`).
 - **Automatic Multi-Turn Continuity per Antigravity Chat:**
   - Always pass `--session-tag <first_8_chars_of_AGY_Conversation_ID>`.

@@ -53,6 +53,8 @@ AGENT_ALIASES: dict[str, str] = {
     "office2": "2291045905737541211",
     "agb": "18420663427156982501",
     "catalyst": "app_catalyst_agent",
+    "netra-office-workflow": "8458183310708652909",
+    "workflow": "8458183310708652909",
 }
 
 # Skills (`agentType: "SKILL_AGENT"`) run inside NORMAL mode (`gemini-4-argon` + `canvasSpec: {}`
@@ -1043,6 +1045,233 @@ def update_agent_from_file(agent_file: str, csesidx: str = DEFAULT_CSESIDX) -> d
             if isinstance(data, dict):
                 data["deployOperation"] = deploy_res
     return data if isinstance(data, dict) else {"result": data}
+
+
+def list_workflows(csesidx: str = DEFAULT_CSESIDX) -> list[dict]:
+    """Lists WORKFLOW_AGENT pipelines on IOH Agentspace with their Agent Flow Builder URLs."""
+    agents = list_agents(include_skills=False, csesidx=csesidx)
+    workflows: list[dict] = []
+    for a in agents:
+        raw_id = a.get("agent_id") or normalize_session_id(a.get("name", ""))
+        # Check if agent is a workflow
+        try:
+            full_def = get_agent(raw_id, csesidx=csesidx, auto_refresh=False)
+            ag = full_def.get("agent", full_def) if isinstance(full_def, dict) else {}
+            if "workflowAgentDefinition" in ag or a.get("agent_type") == "WORKFLOW_AGENT":
+                wf_def = ag.get("workflowAgentDefinition", {})
+                flow = wf_def.get("agentFlow", {})
+                nodes = flow.get("nodes", [])
+                edges = flow.get("edges", [])
+                builder_url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{raw_id}?csesidx={csesidx}"
+                workflows.append({
+                    "agent_id": raw_id,
+                    "name": ag.get("name", a.get("name", "")),
+                    "display_name": ag.get("displayName", a.get("display_name", "")),
+                    "description": ag.get("description", a.get("description", "")),
+                    "state": ag.get("state", a.get("state", "ENABLED")),
+                    "nodes_count": len(nodes),
+                    "edges_count": len(edges),
+                    "builder_url": builder_url,
+                })
+        except Exception:
+            continue
+    return workflows
+
+
+def build_netra_to_office_workflow_payload(
+    workflow_id: str | None = "8458183310708652909",
+    display_name: str = "Netra to Office File Creator Workflow",
+) -> dict:
+    """Constructs the complete, validated multi-agent branched WORKFLOW_AGENT JSON payload."""
+    agent_id = normalize_session_id(workflow_id) if workflow_id and workflow_id != "new" else ""
+    return {
+        "name": agent_id,
+        "displayName": display_name,
+        "description": (
+            "End-to-end multi-agent pipeline: Netra queries live IOH marts -> Human-in-the-loop approval -> "
+            "Condition routing (PPTX vs XLSX) -> Office File Creator builds executive deliverables."
+        ),
+        "workflowAgentDefinition": {
+            "triggerNodeId": "manual_trigger",
+            "agentFlow": {
+                "nodes": [
+                    {
+                        "id": "manual_trigger",
+                        "displayName": "Manual Trigger (Topic & Format)",
+                        "nodeType": "MANUAL_TRIGGER",
+                        "manualTrigger": {},
+                        "outputSchema": {
+                            "properties": {
+                                "analysis_topic": {
+                                    "title": "Analysis Topic & Cohort",
+                                    "description": "Specify the business question, cohort, metric, and date range for Netra to analyze (e.g., 90d CVM conversion and ARPU by brand).",
+                                    "type": "STRING",
+                                    "additionalProperties": {"display_order": 0},
+                                },
+                                "deliverable_format": {
+                                    "title": "Deliverable Format (PPTX or XLSX)",
+                                    "description": "Enter PPTX for an executive slide deck or XLSX for a multi-sheet Excel model.",
+                                    "type": "STRING",
+                                    "additionalProperties": {"display_order": 1},
+                                },
+                            },
+                            "required": ["analysis_topic", "deliverable_format"],
+                        },
+                    },
+                    {
+                        "id": "netra_agent",
+                        "displayName": "Netra Agent",
+                        "nodeType": "AGENT_REFERENCE_NODE",
+                        "agentReferenceNode": {
+                            "agent": "17783079275007264980",
+                            "agentReferenceType": "ADK_AGENT",
+                            "inputParameters": {
+                                "prompt": (
+                                    "You are Netra Agent, the enterprise data coordinator for IOH. "
+                                    "Query live IOH BigQuery marts and perform an exhaustive analysis on: ${manual_trigger.analysis_topic}.\n\n"
+                                    "Target Deliverable Format requested by user: ${manual_trigger.deliverable_format}.\n\n"
+                                    "You MUST structure your response with:\n"
+                                    "1. Headline Executive Summary & Core Quantified Impact\n"
+                                    "2. Complete Multi-Column Data Tables (every cohort, headcount, share %, revenue IDR T, and ARPU)\n"
+                                    "3. Exact Native Chart Series (separating volume metrics from rate/ARPU percentages)\n"
+                                    "4. Slide-by-Slide (for PPTX) or Sheet-by-Sheet (for XLSX) detailed outline with McKinsey action titles and commercial interpretation."
+                                )
+                            },
+                        },
+                    },
+                    {
+                        "id": "approval_step",
+                        "displayName": "Review & Approve Netra Analysis",
+                        "nodeType": "APPROVAL_NODE",
+                        "approvalNode": {
+                            "message": (
+                                "Please review Netra Agent's extracted IOH metrics, tables, and outline before generating the "
+                                "${manual_trigger.deliverable_format} deliverable:\n\n${netra_agent.output}"
+                            )
+                        },
+                    },
+                    {
+                        "id": "format_condition",
+                        "displayName": "Route by Deliverable Format (PPTX vs XLSX)",
+                        "nodeType": "CONDITION_NODE",
+                        "conditionNode": {
+                            "ruleBasedRouting": {
+                                "rules": [
+                                    {
+                                        "branch": "PPTX",
+                                        "rule": {
+                                            "rootExpression": {
+                                                "logicalGroup": {
+                                                    "logicalOperator": "AND",
+                                                    "expressions": [
+                                                        {
+                                                            "condition": {
+                                                                "left": {"variablePath": "manual_trigger.deliverable_format"},
+                                                                "conditionOperator": "CONTAINS",
+                                                                "right": {"literal": "PPTX"},
+                                                            }
+                                                        }
+                                                    ],
+                                                }
+                                            }
+                                        },
+                                    }
+                                ],
+                                "elseBranch": "XLSX",
+                            }
+                        },
+                    },
+                    {
+                        "id": "office_file_creator_pptx",
+                        "displayName": "Office File Creator (Executive PPTX)",
+                        "nodeType": "AGENT_NODE",
+                        "agentNode": {
+                            "model": "gemini-4-argon",
+                            "instruction": (
+                                "You are the Executive Presentation Specialist in the multi-agent workflow. "
+                                "Using the Netra Agent analysis, structured slide outline, and tables below:\n\n"
+                                "${netra_agent.output}\n\n"
+                                "Topic requested: ${manual_trigger.analysis_topic}\n\n"
+                                "Generate an executive McKinsey-grade PowerPoint presentation (.pptx) adhering to these rules:\n"
+                                "1. Follow executive-slides and minimal-slides principles with single-line action titles (<85 chars stating the quantified business conclusion).\n"
+                                "2. Use native editable charts (<c:chart>) separating rate (%) from volume (headcount/IDR) and structured data tables.\n"
+                                "3. Execute python-pptx / pptx_lxml_wrapper in the sandbox to build the widescreen deck.\n"
+                                "4. Upload the final .pptx file to OneDrive /Agentspace_Exports via onedrive_agent__upload_file."
+                            ),
+                            "outputDisplayEnabled": True,
+                            "skillAgentNames": ["14950672669329422296"],
+                        },
+                    },
+                    {
+                        "id": "office_file_creator_xlsx",
+                        "displayName": "Office File Creator (Analytical XLSX)",
+                        "nodeType": "AGENT_NODE",
+                        "agentNode": {
+                            "model": "gemini-4-argon",
+                            "instruction": (
+                                "You are the Spreadsheet & Financial Modeling Specialist in the multi-agent workflow. "
+                                "Using the Netra Agent cohorts, revenue numbers, ARPU, and metrics below:\n\n"
+                                "${netra_agent.output}\n\n"
+                                "Topic requested: ${manual_trigger.analysis_topic}\n\n"
+                                "Generate a multi-sheet analytical Excel workbook (.xlsx) adhering to these rules:\n"
+                                "1. Tab 1: Executive KPI Dashboard & Summary Matrix.\n"
+                                "2. Tab 2: Detailed Cohort & Segment Breakdown with dynamic Excel formulas (SUM, AVERAGE, INDEX/MATCH, SUMIFS) and zero hardcoded totals.\n"
+                                "3. Tab 3: Native Chart Data Series.\n"
+                                "4. Build the workbook using openpyxl / WorkbookBuilder in memory and deliver via generate_document."
+                            ),
+                            "outputDisplayEnabled": True,
+                            "skillAgentNames": ["14950672669329422296"],
+                        },
+                    },
+                ],
+                "edges": [
+                    {"sourceNodeId": "manual_trigger", "targetNodeId": "netra_agent"},
+                    {"sourceNodeId": "netra_agent", "targetNodeId": "approval_step"},
+                    {"sourceNodeId": "approval_step", "targetNodeId": "format_condition"},
+                    {"sourceNodeId": "format_condition", "targetNodeId": "office_file_creator_pptx", "routeString": "PPTX"},
+                    {"sourceNodeId": "format_condition", "targetNodeId": "office_file_creator_xlsx", "routeString": "XLSX"},
+                ],
+            }
+        },
+    }
+
+
+def upsert_netra_office_workflow(
+    workflow_id: str = "8458183310708652909",
+    csesidx: str = DEFAULT_CSESIDX,
+) -> dict:
+    """Updates (or creates if workflow_id == 'new') the Netra -> Office File Creator branched workflow."""
+    agent_id = normalize_session_id(workflow_id)
+    payload_agent = build_netra_to_office_workflow_payload(workflow_id=agent_id)
+    if agent_id and agent_id != "new":
+        payload = {
+            "configId": WIDGET_CONFIG_ID,
+            "additionalParams": {"token": "-", "origin": "AGENT_DESIGNER"},
+            "updateAgentRequest": {
+                "agent": payload_agent,
+                "updateMask": "display_name,description,workflow_agent_definition.agent_flow,workflow_agent_definition.trigger_node_id",
+            },
+        }
+        res, _ = _post_widget_rpc("widgetUpdateAgent", payload, csesidx=csesidx, timeout=60)
+    else:
+        payload = {
+            "configId": WIDGET_CONFIG_ID,
+            "additionalParams": {"token": "-", "origin": "AGENT_DESIGNER"},
+            "createAgentRequest": {
+                "agent": payload_agent,
+            },
+        }
+        res, _ = _post_widget_rpc("widgetCreateAgent", payload, csesidx=csesidx, timeout=60)
+
+    saved_ag = res.get("agent", res) if isinstance(res, dict) else {}
+    target_id = normalize_session_id(saved_ag.get("name", agent_id))
+    builder_url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{target_id}?csesidx={csesidx}"
+    return {
+        "agent": saved_ag,
+        "workflow_id": target_id,
+        "display_name": saved_ag.get("displayName", "Netra to Office File Creator Workflow"),
+        "builder_url": builder_url,
+    }
 
 
 def download_session_media_files(
@@ -2403,6 +2632,19 @@ def main():
         help="List custom agents and skills on Agentspace and exit",
     )
     parser.add_argument(
+        "--list-workflows",
+        action="store_true",
+        help="List WORKFLOW_AGENT pipelines on Agentspace with their Agent Flow Builder URLs and exit",
+    )
+    parser.add_argument(
+        "--sync-netra-workflow",
+        nargs="?",
+        const="8458183310708652909",
+        default=None,
+        metavar="WORKFLOW_ID",
+        help="Deploy/update the Netra -> Office File Creator branched multi-agent workflow (default ID: 8458183310708652909) and exit",
+    )
+    parser.add_argument(
         "--get-agent",
         default=None,
         metavar="AGENT_ID_OR_ALIAS",
@@ -2516,6 +2758,32 @@ def main():
                     print(f"[{a['agent_id']}] ({a['agent_type']} | {a['state']}) {a['display_name']} — {a['description']}")
             return
 
+        if args.list_workflows:
+            workflows = list_workflows(csesidx=args.csesidx)
+            if args.json:
+                print(json.dumps(workflows, indent=2))
+            else:
+                print(f"Found {len(workflows)} WORKFLOW_AGENT pipeline(s) on Agentspace:")
+                for w in workflows:
+                    print(f"\n[{w['agent_id']}] {w['display_name']} (state={w['state']}, nodes={w['nodes_count']}, edges={w['edges_count']})")
+                    print(f"  Description: {w['description']}")
+                    print(f"  Builder Canvas URL: {w['builder_url']}")
+            return
+
+        if args.sync_netra_workflow is not None:
+            sync_res = upsert_netra_office_workflow(workflow_id=args.sync_netra_workflow, csesidx=args.csesidx)
+            if args.json:
+                print(json.dumps(sync_res, indent=2))
+            else:
+                ag = sync_res.get("agent", {})
+                flow = ag.get("workflowAgentDefinition", {}).get("agentFlow", {})
+                print(
+                    f"Successfully synced workflow: {ag.get('displayName')} ({normalize_session_id(ag.get('name', ''))})\n"
+                    f"  Nodes: {len(flow.get('nodes', []))} | Edges: {len(flow.get('edges', []))}\n"
+                    f"  Canvas URL: {ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{normalize_session_id(ag.get('name', ''))}?csesidx={args.csesidx}"
+                )
+            return
+
         if args.get_agent:
             agent_data = get_agent(args.get_agent, csesidx=args.csesidx)
             if args.output_filename:
@@ -2625,7 +2893,8 @@ def main():
 
         if not args.prompt:
             parser.error(
-                "A prompt is required unless --list-sessions, --delete-session, --finish-task, "
+                "A prompt is required unless --list-sessions, --list-agents, --list-workflows, "
+                "--sync-netra-workflow, --get-agent, --update-agent-file, --delete-session, --finish-task, "
                 "--cleanup-media-sessions, --export-slides, or --download-media is specified."
             )
 

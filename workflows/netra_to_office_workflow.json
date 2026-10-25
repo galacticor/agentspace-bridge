@@ -1,0 +1,160 @@
+{
+  "agent": {
+    "name": "8458183310708652909",
+    "displayName": "Netra to Office File Creator Workflow",
+    "description": "End-to-end multi-agent pipeline: Netra queries live IOH marts -> Human-in-the-loop approval -> Condition routing (PPTX vs XLSX) -> Office File Creator builds executive deliverables.",
+    "createTime": "2026-10-24T22:04:13.140739Z",
+    "updateTime": "2026-10-25T04:41:53.888143105Z",
+    "state": "PRIVATE",
+    "sharingConfig": {
+      "scope": "PRIVATE"
+    },
+    "workflowAgentDefinition": {
+      "agentFlow": {
+        "nodes": [
+          {
+            "id": "manual_trigger",
+            "displayName": "Manual Trigger (Topic & Format)",
+            "nodeType": "MANUAL_TRIGGER",
+            "outputSchema": {
+              "properties": {
+                "deliverable_format": {
+                  "title": "Deliverable Format (PPTX or XLSX)",
+                  "description": "Enter PPTX for an executive slide deck or XLSX for a multi-sheet Excel model.",
+                  "type": "STRING",
+                  "additionalProperties": {
+                    "display_order": 1
+                  }
+                },
+                "analysis_topic": {
+                  "title": "Analysis Topic & Cohort",
+                  "description": "Specify the business question, cohort, metric, and date range for Netra to analyze (e.g., 90d CVM conversion and ARPU by brand).",
+                  "type": "STRING",
+                  "additionalProperties": {
+                    "display_order": 0
+                  }
+                }
+              },
+              "required": [
+                "analysis_topic",
+                "deliverable_format"
+              ]
+            },
+            "manualTrigger": {}
+          },
+          {
+            "id": "netra_agent",
+            "displayName": "Netra Agent",
+            "nodeType": "AGENT_REFERENCE_NODE",
+            "agentReferenceNode": {
+              "agent": "17783079275007264980",
+              "agentReferenceType": "ADK_AGENT",
+              "inputParameters": {
+                "prompt": "You are Netra Agent, the enterprise data coordinator for IOH. Query live IOH BigQuery marts and perform an exhaustive analysis on: ${manual_trigger.analysis_topic}.\n\nTarget Deliverable Format requested by user: ${manual_trigger.deliverable_format}.\n\nYou MUST structure your response with:\n1. Headline Executive Summary & Core Quantified Impact\n2. Complete Multi-Column Data Tables (every cohort, headcount, share %, revenue IDR T, and ARPU)\n3. Exact Native Chart Series (separating volume metrics from rate/ARPU percentages)\n4. Slide-by-Slide (for PPTX) or Sheet-by-Sheet (for XLSX) detailed outline with McKinsey action titles and commercial interpretation."
+              }
+            }
+          },
+          {
+            "id": "approval_step",
+            "displayName": "Review & Approve Netra Analysis",
+            "nodeType": "APPROVAL_NODE",
+            "approvalNode": {
+              "message": "Please review Netra Agent's extracted IOH metrics, tables, and outline before generating the ${manual_trigger.deliverable_format} deliverable:\n\n${netra_agent.output}"
+            }
+          },
+          {
+            "id": "format_condition",
+            "displayName": "Route by Deliverable Format (PPTX vs XLSX)",
+            "nodeType": "CONDITION_NODE",
+            "conditionNode": {
+              "ruleBasedRouting": {
+                "rules": [
+                  {
+                    "branch": "PPTX",
+                    "rule": {
+                      "rootExpression": {
+                        "logicalGroup": {
+                          "logicalOperator": "AND",
+                          "expressions": [
+                            {
+                              "condition": {
+                                "left": {
+                                  "variablePath": "manual_trigger.deliverable_format"
+                                },
+                                "conditionOperator": "CONTAINS",
+                                "right": {
+                                  "literal": "PPTX"
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ],
+                "elseBranch": "XLSX"
+              }
+            }
+          },
+          {
+            "id": "office_file_creator_pptx",
+            "displayName": "Office File Creator (Executive PPTX)",
+            "agentNode": {
+              "model": "gemini-4-argon",
+              "instruction": "You are the Executive Presentation Specialist in the multi-agent workflow. Using the Netra Agent analysis, structured slide outline, and tables below:\n\n${netra_agent.output}\n\nTopic requested: ${manual_trigger.analysis_topic}\n\nGenerate an executive McKinsey-grade PowerPoint presentation (.pptx) adhering to these rules:\n1. Follow executive-slides and minimal-slides principles with single-line action titles (<85 chars stating the quantified business conclusion).\n2. Use native editable charts (<c:chart>) separating rate (%) from volume (headcount/IDR) and structured data tables.\n3. Execute python-pptx / pptx_lxml_wrapper in the sandbox to build the widescreen deck.\n4. Upload the final .pptx file to OneDrive /Agentspace_Exports via onedrive_agent__upload_file.",
+              "outputDisplayEnabled": true,
+              "skillAgentNames": [
+                "14950672669329422296"
+              ]
+            },
+            "nodeType": "AGENT_NODE"
+          },
+          {
+            "id": "office_file_creator_xlsx",
+            "displayName": "Office File Creator (Analytical XLSX)",
+            "agentNode": {
+              "model": "gemini-4-argon",
+              "instruction": "You are the Spreadsheet & Financial Modeling Specialist in the multi-agent workflow. Using the Netra Agent cohorts, revenue numbers, ARPU, and metrics below:\n\n${netra_agent.output}\n\nTopic requested: ${manual_trigger.analysis_topic}\n\nGenerate a multi-sheet analytical Excel workbook (.xlsx) adhering to these rules:\n1. Tab 1: Executive KPI Dashboard & Summary Matrix.\n2. Tab 2: Detailed Cohort & Segment Breakdown with dynamic Excel formulas (SUM, AVERAGE, INDEX/MATCH, SUMIFS) and zero hardcoded totals.\n3. Tab 3: Native Chart Data Series.\n4. Build the workbook using openpyxl / WorkbookBuilder in memory and deliver via generate_document.",
+              "outputDisplayEnabled": true,
+              "skillAgentNames": [
+                "14950672669329422296"
+              ]
+            },
+            "nodeType": "AGENT_NODE"
+          }
+        ],
+        "edges": [
+          {
+            "sourceNodeId": "manual_trigger",
+            "targetNodeId": "netra_agent"
+          },
+          {
+            "sourceNodeId": "netra_agent",
+            "targetNodeId": "approval_step"
+          },
+          {
+            "sourceNodeId": "approval_step",
+            "targetNodeId": "format_condition"
+          },
+          {
+            "sourceNodeId": "format_condition",
+            "targetNodeId": "office_file_creator_pptx",
+            "routeString": "PPTX"
+          },
+          {
+            "sourceNodeId": "format_condition",
+            "targetNodeId": "office_file_creator_xlsx",
+            "routeString": "XLSX"
+          }
+        ]
+      },
+            "triggerNodeId": "manual_trigger"
+    },
+    "activeRevision": "8458183310708652909/revisions/10993483651066342887",
+    "agentIdentityInfo": {},
+    "observabilityConfig": {
+      "observabilityEnabled": true
+    }
+  }
+}

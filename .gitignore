@@ -9,3 +9,7 @@ getoxsrf*
 __pycache__/
 *.pyc
 .DS_Store
+test_*.pptx
+pptx_payload.txt
+office_creator_v2_patched.json
+office_creator_v1_promoted.json

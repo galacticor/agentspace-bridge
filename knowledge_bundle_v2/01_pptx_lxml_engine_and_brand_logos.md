@@ -1,23 +1,21 @@
 # Knowledge Reference 1: Zero-Dependency `pptx_lxml_wrapper` Engine (`presentation_designer`)
 
 > **CRITICAL SANDBOX & ONEDRIVE UPLOAD RULE FOR `.pptx` (ZERO `ContentBytes` / `pptx_payload.txt` BRIDGE):**
-> 1. Always save `pptx_lxml_wrapper.py` to `/home/bard/pptx_lxml_wrapper.py` inside `file_and_coding_agent` and import `create_widescreen_prs`, `add_header_and_footer`, `add_top_accent_card`, `add_metric_callout`, `add_tufte_table`, `add_native_column_chart`, and `add_callout_strip`.
-> 2. **How We Avoid Broken `.pptx` Files & `ContentBytes` Token Burn (`pptx_payload.txt` Session Bridge):**
->    - Because `/home/bard` ignores `.pptx` files when indexing session attachments, passing `InputFileName="<DeckName>.pptx"` with blank `ContentBytes` fails lookup, while passing a 35,000-character Base64 string in `ContentBytes` causes LLM token truncation/corruption and breaks the `.pptx` file on OneDrive!
->    - Instead, `prs.save("<DeckName>.pptx")` automatically writes an exact byte-for-byte copy of the raw `.pptx` binary to **`pptx_payload.txt`** (`/home/bard/pptx_payload.txt`), which `/home/bard` automatically attaches to the session's `Files currently attached` registry!
-> 3. **Mandatory `onedrive_agent__upload_file` Parameters (`HasBytes: false`, `ContentBytes: ""`):**
->    - Always pass:
->      - `FileName`: `"<DeckName>.pptx"` (the target `.pptx` filename on OneDrive)
->      - `InputFileName`: `"pptx_payload.txt"` (the attached session file containing the raw `.pptx` binary bytes!)
->      - `HasBytes`: `false`
->      - `ContentBytes`: `""` (leave **completely empty/blank** — NEVER pass Base64 inside `ContentBytes`!)
->    - Google's OneDrive connector streams the exact binary bytes directly from `pptx_payload.txt` into `<DeckName>.pptx` on OneDrive with **100% bit-for-bit integrity** and **zero `ContentBytes` token cost**!
-> 4. **Do NOT upload `.xlsx` or `.docx` to OneDrive** — `.xlsx` and `.docx` use `[Generate Document](tool://generate_document)` for native in-chat download buttons!
-> 5. *(Optional Custom Logos)*: You can add your own brand logo PNG helpers (`add_picture_b64(slide, x, y, w, h, b64_png)`) at the bottom of `pptx_lxml_wrapper.py` where suited.
+> 1. Always save `pptx_lxml_wrapper.py` to `/home/bard/pptx_lxml_wrapper.py` inside `file_and_coding_agent` and import `create_widescreen_prs`, `add_header_and_footer`, `add_top_accent_card`, `add_metric_callout`, `add_tufte_table`, `add_native_column_chart`, `add_roadmap_waves`, `add_callout_strip`, and `add_appendix_table_slide`.
+> 2. **True Native Editable OOXML Charts (`<c:chartSpace>` in `ppt/charts/chart{k}.xml`):**
+>    - `add_native_column_chart(slide, x, y, w, h, categories, series_list, chart_type="col", number_format="0.0", show_legend=True)` emits real editable PowerPoint `<c:chartSpace>` XML parts supporting:
+>      - Clustered Column (`chart_type="col"`), Horizontal Bar (`chart_type="bar"`), Line (`chart_type="line"`), and **Dual-Axis Combo (`chart_type="combo"`)** by passing `"line"` as the 4th tuple element in any secondary-axis series: `("3ID Loan Rev (IDR B)", [24.7, 28.2, 26.2, 30.8, 33.9], C_TEAL, "line")`.
+>      - Positive and negative values (`-1106`, `-2716`, `-1704`) plotted naturally across zero.
+> 3. **100% Outline Fidelity & Smart Table Pagination (`add_appendix_table_slide`):**
+>    - When the user prompt includes an explicit **Slide-by-Slide Outline** (e.g., Netra Section 5A), adopt the exact slide count, verbatim McKinsey Action Titles (auto-scaled `18pt`/`16pt`/`14.5pt` up to `118` chars), and exact chart types (`combo`, `col`, `bar`, `line`).
+>    - When a slide combines a Chart or 3-Wave Roadmap (`add_roadmap_waves`) with a granular table of `> 8` rows (e.g., a 14-row Brand × Cohort × ARPU Tier breakdown), display a **5–6 row Executive Summary Table** on the main slide so nothing is cramped or dropped, and call `add_appendix_table_slide(prs, slide_num, total_slides, tracker, action_title, subtitle, headers, full_rows, ...)` to append the **complete granular table on an Appendix Backup Slide**!
+> 4. **Mandatory `onedrive_agent__upload_file` Parameters (`HasBytes: false`, `ContentBytes: ""`):**
+>    - `prs.save("<DeckName>.pptx")` writes the raw `.pptx` binary to `pptx_payload.txt` (`/home/bard/pptx_payload.txt`).
+>    - Always pass `FileName: "<DeckName>.pptx"`, `InputFileName: "pptx_payload.txt"`, `HasBytes: false`, `ContentBytes: ""` (leave completely blank!).
 
 ```python
-# pptx_lxml_wrapper.py — Self-Contained Zero-Dependency OOXML .pptx Micro-Engine + Iterative Visual & Coordinate QA Gate
-import os, zipfile, base64, math
+# pptx_lxml_wrapper.py — Self-Contained Zero-Dependency OOXML .pptx Micro-Engine (True Native <c:chartSpace> Charts + Iterative Visual QA Gate)
+import os, zipfile, base64, math, html
 try:
     from lxml import etree; _LXML = True
 except ImportError:
@@ -25,9 +23,10 @@ except ImportError:
 
 O = "http://schemas.openxmlformats.org"
 P_NS, A_NS, R_NS = f"{O}/presentationml/2006/main", f"{O}/drawingml/2006/main", f"{O}/officeDocument/2006/relationships"
+C_NS = f"{O}/drawingml/2006/chart"
 A_TBL_URI, PK_R, CT_NS = f"{O}/drawingml/2006/table", f"{O}/package/2006/relationships", f"{O}/package/2006/content-types"
 if not _LXML:
-    for k, v in (("a", A_NS), ("r", R_NS), ("p", P_NS)): etree.register_namespace(k, v)
+    for k, v in (("a", A_NS), ("r", R_NS), ("p", P_NS), ("c", C_NS)): etree.register_namespace(k, v)
 NSMAP, EMU = {"a": A_NS, "r": R_NS, "p": P_NS}, 914400
 def Inches(v): return float(v)
 def Pt(v): return float(v)
@@ -37,7 +36,7 @@ def _hex(c, d="0F172A"): return str(c).lstrip("#").upper() if c else d
 class PP_ALIGN: LEFT="l"; CENTER="ctr"; RIGHT="r"
 class MSO_ANCHOR: TOP="t"; MIDDLE="ctr"; BOTTOM="b"
 class MSO_SHAPE: RECTANGLE="rect"; ROUNDED_RECTANGLE="roundRect"
-class XL_CHART_TYPE: COLUMN_CLUSTERED="col"; BAR_CLUSTERED="bar"; LINE="line"
+class XL_CHART_TYPE: COLUMN_CLUSTERED="col"; BAR_CLUSTERED="bar"; LINE="line"; COMBO="combo"
 
 C_BG, C_SURFACE, C_TINT = "FFFFFF", "F8FAFC", "F1F5F9"
 C_TINT_ROSE, C_TINT_INDIGO, C_TINT_TEAL = "FFF1F2", "EEF2FF", "F0FDFA"
@@ -51,7 +50,7 @@ _LN_S = "".join(f"<a:ln w=\"{w}\" cap=\"flat\" cmpd=\"sng\" algn=\"ctr\"><a:soli
 THEME_XML = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="{A_NS}" name="Exec"><a:themeElements><a:clrScheme name="Exec">{_C_TAGS}</a:clrScheme><a:fontScheme name="ExecF"><a:majorFont><a:latin typeface="Arial"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme><a:fmtScheme name="ExecFmt"><a:fillStyleLst>{_SF3}</a:fillStyleLst><a:lnStyleLst>{_LN_S}</a:lnStyleLst><a:effectStyleLst>{"<a:effectStyle><a:effectLst/></a:effectStyle>"*3}</a:effectStyleLst><a:bgFillStyleLst>{_SF3}</a:bgFillStyleLst></a:fmtScheme></a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>'
 
 class _Prs:
-    def __init__(self): self.slides, self._id, self._qa = [], 2, []
+    def __init__(self): self.slides, self._id, self._qa, self._charts = [], 2, [], []
 
     def run_visual_qa(self, render_png_dir="/home/bard"):
         issues = []
@@ -61,12 +60,12 @@ class _Prs:
             for a in items:
                 k, x, y, w, h, lbl = a["kind"], a["x"], a["y"], a["w"], a["h"], a["label"]
                 if k in ("bg", "rule", "accent_bar"): continue
-                if k == "title" and len(lbl) > 88:
-                    issues.append(f"Slide {s_idx} [TITLE_OVERFLOW]: Title is {len(lbl)} chars (>88 max). Shorten to <=82 chars."); fids.add(id(a))
+                if k == "title" and len(lbl) > 118:
+                    issues.append(f"Slide {s_idx} [TITLE_OVERFLOW]: Title is {len(lbl)} chars (>118 max). Shorten to <=112 chars."); fids.add(id(a))
                 if k not in ("header", "title", "subtitle", "footer") and (y + h > 7.06 or x + w > 12.95 or x < 0.20 or y < 1.12):
                     issues.append(f"Slide {s_idx} [BOUNDARY_BREACH]: {k} '{lbl[:28]}' (x={x:.2f},y={y:.2f},w={w:.2f},h={h:.2f},bottom={y+h:.2f}) breaches body safe zone (y in 1.14..7.05). Reduce h or move y up."); fids.add(id(a))
-                if k == "table" and (h / max(a.get("nrows", 2), 1)) < 0.22:
-                    issues.append(f"Slide {s_idx} [TABLE_CRAMPED]: Table '{lbl[:24]}' row height < 0.22\". Increase h to >= {a.get('nrows',2)*0.24:.2f}\"."); fids.add(id(a))
+                if k == "table" and (h / max(a.get("nrows", 2), 1)) < 0.21:
+                    issues.append(f"Slide {s_idx} [TABLE_CRAMPED]: Table '{lbl[:24]}' row height < 0.21\" ({a.get('nrows',2)} rows in h={h:.2f}\"). If >8 rows on a multi-element slide, show a 5-7 row summary table on the main slide and call add_appendix_table_slide() for the full granular table!"); fids.add(id(a))
                 if k in ("text", "bullets", "callout"):
                     fs = a.get("fs", 10.0)
                     cpl = max(12.0, (w - 0.12) * 72.0 / max(fs * 0.54, 4.0))
@@ -80,18 +79,6 @@ class _Prs:
                     aa, ba = a["w"]*a["h"], b["w"]*b["h"]
                     if area > 0.04 and not (a["kind"] == "card" and area >= 0.85 * ba) and not (b["kind"] == "card" and area >= 0.85 * aa):
                         issues.append(f"Slide {s_idx} [OVERLAP]: {a['kind']} '{a['label'][:20]}' (y={a['y']:.2f}..{a['y']+a['h']:.2f}) overlaps {b['kind']} '{b['label'][:20]}' (y={b['y']:.2f}..{b['y']+b['h']:.2f}). Adjust y/h."); fids.add(id(a)); fids.add(id(b))
-            try:
-                from PIL import Image, ImageDraw
-                if render_png_dir and os.path.isdir(render_png_dir):
-                    img = Image.new("RGB", (1333, 750), (248, 250, 252)); drw = ImageDraw.Draw(img)
-                    for it in items:
-                        x0, y0, x1, y1 = int(it["x"]*100), int(it["y"]*100), int((it["x"]+it["w"])*100), int((it["y"]+it["h"])*100)
-                        rgb = tuple(int(_hex(it["fill"])[k:k+2], 16) for k in (0, 2, 4)) if it.get("fill") else None
-                        ol = (255, 0, 0) if id(it) in fids else ((203, 213, 225) if it["kind"] in ("card", "metric", "table", "chart", "callout") else None)
-                        if rgb or ol: drw.rectangle([x0, y0, max(x0+1, x1), max(y0+1, y1)], fill=rgb, outline=ol, width=3 if id(it) in fids else 1)
-                        if it["label"] and it["kind"] != "bg": drw.text((x0+4, y0+2), str(it["label"])[:65], fill=(225, 29, 72) if id(it) in fids else (15, 23, 42))
-                    img.save(os.path.join(render_png_dir, f"slide_{s_idx}.png"))
-            except Exception: pass
         return issues
 
     def save(self, out_path="output.pptx", strict_qa=True):
@@ -117,13 +104,18 @@ class _Prs:
             z.writestr("ppt/slideMasters/_rels/slideMaster1.xml.rels", f'{hdr}<Relationships xmlns="{PK_R}"><Relationship Id="rId1" Type="{R_NS}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="{R_NS}/theme" Target="../theme/theme1.xml"/></Relationships>')
             z.writestr("ppt/slideLayouts/slideLayout1.xml", f'{hdr}<p:sldLayout xmlns:a="{A_NS}" xmlns:r="{R_NS}" xmlns:p="{P_NS}" type="blank">{sp0}</p:sldLayout>')
             z.writestr("ppt/slideLayouts/_rels/slideLayout1.xml.rels", f'{hdr}<Relationships xmlns="{PK_R}"><Relationship Id="rId1" Type="{R_NS}/slideMaster" Target="../slideMasters/slideMaster1.xml"/></Relationships>')
-            for i, (sld, _) in enumerate(self.slides, 1):
+            for c_idx, c_xml in self._charts:
+                ct.append(f'<Override PartName="/ppt/charts/chart{c_idx}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>')
+                z.writestr(f"ppt/charts/chart{c_idx}.xml", c_xml)
+            for i, s_item in enumerate(self.slides, 1):
+                sld, _, s_c_rels = s_item[0], s_item[1], (s_item[2] if len(s_item) > 2 else [])
                 rels.append(f'<Relationship Id="rId{i}" Type="{R_NS}/slide" Target="slides/slide{i}.xml"/>')
                 s_ids.append(f'<p:sldId id="{255+i}" r:id="rId{i}"/>')
                 ct.append(f'<Override PartName="/ppt/slides/slide{i}.xml" ContentType="{P_M}.slide+xml"/>')
                 xb = etree.tostring(sld, xml_declaration=True, encoding="UTF-8") if _LXML else (hdr.encode("utf-8") + etree.tostring(sld, encoding="utf-8"))
                 z.writestr(f"ppt/slides/slide{i}.xml", xb)
-                z.writestr(f"ppt/slides/_rels/slide{i}.xml.rels", f'{hdr}<Relationships xmlns="{PK_R}"><Relationship Id="rId1" Type="{R_NS}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>')
+                c_rel_str = "".join(f'<Relationship Id="{cr_id}" Type="{R_NS}/chart" Target="../charts/chart{c_idx}.xml"/>' for cr_id, c_idx in s_c_rels)
+                z.writestr(f"ppt/slides/_rels/slide{i}.xml.rels", f'{hdr}<Relationships xmlns="{PK_R}"><Relationship Id="rId1" Type="{R_NS}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>{c_rel_str}</Relationships>')
             z.writestr("[Content_Types].xml", "".join(ct) + "</Types>")
             z.writestr("ppt/_rels/presentation.xml.rels", "".join(rels) + "</Relationships>")
             z.writestr("ppt/presentation.xml", f'{hdr}<p:presentation xmlns:a="{A_NS}" xmlns:r="{R_NS}" xmlns:p="{P_NS}" saveSubsetFonts="1"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rIdM"/></p:sldMasterIdLst><p:sldIdLst>{"".join(s_ids)}</p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>')
@@ -152,12 +144,12 @@ def add_blank_slide(prs, bg_color=C_SURFACE):
     etree.SubElement(nv, f"{{{P_NS}}}cNvPr", id="1", name=""); etree.SubElement(nv, f"{{{P_NS}}}cNvGrpSpPr"); etree.SubElement(nv, f"{{{P_NS}}}nvPr")
     xf = etree.SubElement(etree.SubElement(spTree, f"{{{P_NS}}}grpSpPr"), f"{{{A_NS}}}xfrm")
     for tag in ("off", "ext", "chOff", "chExt"): etree.SubElement(xf, f"{{{A_NS}}}{tag}", **({"x":"0","y":"0"} if "Off" in tag or tag=="off" else {"cx":"0","cy":"0"}))
-    s_qa = []; prs._qa.append(s_qa); slide = (sld, spTree, prs, s_qa); prs.slides.append((sld, spTree))
+    s_qa, s_crels = [], []; prs._qa.append(s_qa); slide = (sld, spTree, prs, s_qa, s_crels); prs.slides.append((sld, spTree, s_crels))
     _sp(slide, 0, 0, 13.333, 7.5, fill=bg_color, b_col=None, prst="rect", _qa_kind="bg")
     return slide
 
 def _sp(slide, x, y, w, h, fill=None, b_col=None, b_pt=0.75, prst="rect", rad=0.04, paras=(), align="l", anchor="t", _qa_kind=None, _qa_label=None):
-    _, spTree, prs, _ = slide; prs._id += 1
+    spTree, prs = slide[1], slide[2]; prs._id += 1
     sp = etree.SubElement(spTree, f"{{{P_NS}}}sp"); nv = etree.SubElement(sp, f"{{{P_NS}}}nvSpPr")
     etree.SubElement(nv, f"{{{P_NS}}}cNvPr", id=str(prs._id), name=f"s{prs._id}"); etree.SubElement(nv, f"{{{P_NS}}}cNvSpPr"); etree.SubElement(nv, f"{{{P_NS}}}nvPr")
     spPr = etree.SubElement(sp, f"{{{P_NS}}}spPr"); xf = etree.SubElement(spPr, f"{{{A_NS}}}xfrm")
@@ -208,8 +200,10 @@ def add_metric_callout(slide, x, y, w, h, eyebrow, hero_val, sub_label, accent=C
     _sp(slide, x+0.14, y+0.84, w-0.28, max(0.25, h-0.90), paras=[[(sub_label, 9.0, False, C_SLATE, FONT_BODY)]], _qa_kind="skip")
 
 def add_header_and_footer(slide, slide_num, tracker, action_title, subtitle, source_note="Source: IOH Enterprise Analytics", total_slides=8):
+    t_len = len(str(action_title or ""))
+    t_fs = 18.0 if t_len <= 82 else (16.0 if t_len <= 96 else 14.5)
     add_textbox(slide, 0.55, 0.28, 10.0, 0.20, tracker, 8.5, True, C_CORAL, FONT_HEAD, _qa_kind="header")
-    add_textbox(slide, 0.55, 0.48, 12.23, 0.36, action_title, 18.0, True, C_DARK, FONT_HEAD, _qa_kind="title")
+    add_textbox(slide, 0.55, 0.48, 12.23, 0.36, action_title, t_fs, True, C_DARK, FONT_HEAD, _qa_kind="title")
     add_textbox(slide, 0.55, 0.84, 12.23, 0.24, subtitle, 10.5, False, C_MUTED, FONT_BODY, _qa_kind="subtitle")
     _sp(slide, 0.55, 1.12, 12.23, 0.01, fill=C_BORDER, b_col=None, _qa_kind="rule"); _sp(slide, 0.55, 7.08, 12.23, 0.008, fill=C_BORDER, b_col=None, _qa_kind="rule")
     add_textbox(slide, 0.55, 7.13, 11.2, 0.22, source_note, 8.0, False, C_MUTED, FONT_BODY, _qa_kind="footer")
@@ -220,8 +214,20 @@ def add_callout_strip(slide, x, y, w, h, lead_in, body_text, accent=C_INDIGO, bg
     _sp(slide, x, y, 0.06, h, fill=accent, b_col=None, _qa_kind="accent_bar")
     return _sp(slide, x+0.16, y+0.08, w-0.28, h-0.16, paras=[[(f"{lead_in}: ", 9.5, True, accent, FONT_HEAD), (body_text, 9.5, False, C_DARK, FONT_BODY)]], anchor="ctr", _qa_kind="skip")
 
+def add_roadmap_waves(slide, x, y, w, h, waves):
+    n = max(len(waves), 1); gap = 0.22; cw = (w - gap * (n - 1)) / n
+    for i, wv in enumerate(waves):
+        wx = x + i * (cw + gap)
+        phase, title, bullets, accent = wv[0], wv[1], wv[2], (wv[3] if len(wv) > 3 else [C_CORAL, C_INDIGO, C_TEAL][i % 3])
+        _sp(slide, wx, y, cw, h, fill=C_WHITE, b_col=C_BORDER, b_pt=0.75, _qa_kind="card", _qa_label=f"{phase}: {title}")
+        _sp(slide, wx, y, cw, 0.05, fill=accent, b_col=None, _qa_kind="accent_bar")
+        _sp(slide, wx+0.12, y+0.10, cw-0.24, 0.20, paras=[[(str(phase), 8.5, True, accent, FONT_HEAD)]], _qa_kind="skip")
+        _sp(slide, wx+0.12, y+0.30, cw-0.24, 0.28, paras=[[(str(title), 10.5, True, C_DARK, FONT_HEAD)]], _qa_kind="skip")
+        b_paras = [[(f"▪ {ld}: ", 8.8, True, C_DARK, FONT_BODY), (str(bd), 8.8, False, C_SLATE, FONT_BODY)] if isinstance(b_it, (list, tuple)) and len(b_it)>=2 else [(f"▪ {b_it}", 8.8, False, C_SLATE, FONT_BODY)] for b_it in bullets for ld, bd in ([b_it[:2]] if isinstance(b_it, (list, tuple)) and len(b_it)>=2 else [(None, None)])]
+        _sp(slide, wx+0.12, y+0.60, cw-0.24, max(0.30, h-0.66), paras=b_paras, _qa_kind="skip")
+
 def add_tufte_table(slide, x, y, w, h, headers, rows, col_widths=None, num_cols=None, highlight_rows=None, bold_rows=None, accent_cols=None, font_size=9.5, header_bg=C_DARK, header_fg=C_WHITE):
-    _, spTree, prs, _ = slide; prs._id += 1
+    spTree, prs = slide[1], slide[2]; prs._id += 1
     _rec(slide, "table", x, y, w, h, label=" | ".join(str(c) for c in headers[:4]), fill=C_WHITE, nrows=len(rows)+1)
     num_cols, highlight_rows, bold_rows, accent_cols = set(num_cols or []), highlight_rows or {}, set(bold_rows or []), accent_cols or {}
     nc = max(len(headers), 1); cws = col_widths if (col_widths and len(col_widths)==nc) else [w/nc]*nc; rh = int((h / (len(rows) + 1)) * EMU)
@@ -253,20 +259,64 @@ def add_tufte_table(slide, x, y, w, h, headers, rows, col_widths=None, num_cols=
         for ci, val in enumerate(rvals[:nc]): _c(rtr, val, ib or ci==0 or ci in accent_cols, accent_cols.get(ci, C_DARK), rbg, "r" if ci in num_cols else "l", None, 0, bc, bw, FONT_BODY)
     return tbl
 
-def add_native_column_chart(slide, x, y, w, h, categories, series_list, chart_type="col", number_format="0.0", show_legend=True):
-    _sp(slide, x, y, w, h, fill=C_WHITE, b_col=C_BORDER, b_pt=0.5, _qa_kind="chart", _qa_label="Chart: " + ", ".join(s[0] for s in series_list))
-    if show_legend:
-        lx = x + 0.15
-        for s_name, _, s_col in series_list:
-            _sp(slide, lx, y+0.10, 0.14, 0.14, fill=s_col, b_col=None, _qa_kind="skip"); _sp(slide, lx+0.18, y+0.08, 1.8, 0.18, paras=[[(s_name, 8.0, True, C_SLATE, FONT_BODY)]], _qa_kind="skip"); lx += 2.0
-    max_v = max([max(vals or [1]) for _, vals, _ in series_list] + [1.0]) * 1.18
-    py, ph, px, pw = y + 0.36, h - 0.72, x + 0.35, w - 0.50; _sp(slide, px, py+ph, pw, 0.01, fill=C_SLATE, b_col=None, _qa_kind="skip")
-    nc, ns = max(len(categories), 1), max(len(series_list), 1); gw = pw / nc; bw = min(0.42, (gw * 0.68) / ns)
-    for ci, cat in enumerate(categories):
-        gx = px + ci * gw + (gw - bw * ns) / 2
-        for si, (_, vals, s_col) in enumerate(series_list):
-            v = float(vals[ci]) if ci < len(vals) else 0.0; bh = max(0.03, (v / max_v) * ph); bx, by = gx + si * bw, py + ph - bh
-            _sp(slide, bx, by, bw * 0.9, bh, fill=s_col, b_col=None, _qa_kind="skip")
-            _sp(slide, bx-0.08, by-0.20, bw+0.16, 0.18, paras=[[(f"{v:.1f}" if isinstance(v, float) and not v.is_integer() else str(int(v)), 7.5, True, C_DARK, FONT_HEAD)]], align=PP_ALIGN.CENTER, _qa_kind="skip")
-        _sp(slide, px + ci * gw, py + ph + 0.05, gw, 0.25, paras=[[(str(cat), 8.0, False, C_SLATE, FONT_BODY)]], align=PP_ALIGN.CENTER, _qa_kind="skip")
+def add_appendix_table_slide(prs, slide_num, total_slides, tracker, action_title, subtitle, headers, rows, col_widths=None, num_cols=None, highlight_rows=None, bold_rows=None, accent_cols=None, callout_lead="Granular Audit Traceability", callout_body="Complete un-truncated cohort breakdown from BigQuery snapshot mart.", source_note="Source: IOH Enterprise Analytics"):
+    s = add_blank_slide(prs)
+    add_header_and_footer(s, slide_num, tracker, action_title, subtitle, source_note=source_note, total_slides=total_slides)
+    tbl_h = min(5.00, max(2.40, (len(rows) + 1) * 0.30))
+    add_tufte_table(s, 0.55, 1.22, 12.23, tbl_h, headers, rows, col_widths=col_widths, num_cols=num_cols, highlight_rows=highlight_rows, bold_rows=bold_rows, accent_cols=accent_cols, font_size=9.0)
+    add_callout_strip(s, 0.55, 6.38, 12.23, 0.58, callout_lead, callout_body, accent=C_INDIGO, bg_color=C_TINT_INDIGO)
+    return s
+
+def add_native_column_chart(slide, x, y, w, h, categories, series_list, chart_type="col", number_format="0.0", show_legend=True, secondary_series=None):
+    spTree, prs, s_crels = slide[1], slide[2], slide[4]; prs._id += 1
+    _sp(slide, x, y, w, h, fill=C_WHITE, b_col=C_BORDER, b_pt=0.75, _qa_kind="chart", _qa_label="Chart: " + ", ".join(str(s[0]) for s in series_list))
+    c_idx = len(prs._charts) + 1; r_id = f"rIdC{c_idx}"; s_crels.append((r_id, c_idx))
+    gf = etree.SubElement(spTree, f"{{{P_NS}}}graphicFrame"); nv = etree.SubElement(gf, f"{{{P_NS}}}nvGraphicFramePr")
+    etree.SubElement(nv, f"{{{P_NS}}}cNvPr", id=str(prs._id), name=f"Chart {c_idx}")
+    etree.SubElement(etree.SubElement(nv, f"{{{P_NS}}}cNvGraphicFramePr"), f"{{{A_NS}}}graphicFrameLocks", noGrp="1"); etree.SubElement(nv, f"{{{P_NS}}}nvPr")
+    xf = etree.SubElement(gf, f"{{{P_NS}}}xfrm")
+    etree.SubElement(xf, f"{{{A_NS}}}off", x=str(int((float(x)+0.06)*EMU)), y=str(int((float(y)+0.06)*EMU)))
+    etree.SubElement(xf, f"{{{A_NS}}}ext", cx=str(int((float(w)-0.12)*EMU)), cy=str(int((float(h)-0.12)*EMU)))
+    gd = etree.SubElement(etree.SubElement(gf, f"{{{A_NS}}}graphic"), f"{{{A_NS}}}graphicData", uri=C_NS)
+    ch_el = etree.SubElement(gd, f"{{{C_NS}}}chart", nsmap={"c": C_NS, "r": R_NS}) if _LXML else etree.SubElement(gd, f"{{{C_NS}}}chart")
+    ch_el.set(f"{{{R_NS}}}id", r_id)
+    ct_mode = str(chart_type or "col").lower()
+    pri_s, sec_s = [], list(secondary_series or [])
+    for s in series_list:
+        if len(s) >= 4 and str(s[3]).lower() in ("line", "sec", "secondary", "true", "1"): sec_s.append(s[:3])
+        else: pri_s.append(s[:3])
+    if not pri_s and sec_s: pri_s, sec_s = sec_s, []
+    cats_xml = f'<c:ptCount val="{len(categories)}"/>' + "".join(f'<c:pt idx="{i}"><c:v>{html.escape(str(c))}</c:v></c:pt>' for i, c in enumerate(categories))
+    def _ser_xml(idx, name, vals, col_hex, is_line=False):
+        hx = _hex(col_hex, C_INDIGO)
+        pts = f'<c:formatCode>{html.escape(str(number_format or "General"))}</c:formatCode><c:ptCount val="{len(vals)}"/>' + "".join(f'<c:pt idx="{i}"><c:v>{float(v)}</c:v></c:pt>' for i, v in enumerate(vals))
+        sp_pr = f'<c:spPr><a:ln w="28575"><a:solidFill><a:srgbClr val="{hx}"/></a:solidFill></a:ln></c:spPr><c:marker><c:symbol val="circle"/><c:size val="6"/><c:spPr><a:solidFill><a:srgbClr val="{hx}"/></a:solidFill></c:spPr></c:marker>' if is_line else f'<c:spPr><a:solidFill><a:srgbClr val="{hx}"/></a:solidFill></c:spPr><c:invertIfNegative val="0"/>'
+        return f'<c:ser><c:idx val="{idx}"/><c:order val="{idx}"/><c:tx><c:v>{html.escape(str(name))}</c:v></c:tx>{sp_pr}<c:cat><c:strRef><c:strCache>{cats_xml}</c:strCache></c:strRef></c:cat><c:val><c:numRef><c:numCache>{pts}</c:numCache></c:numRef></c:val></c:ser>'
+    dlbls = '<c:dLbls><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="800" b="1"><a:solidFill><a:srgbClr val="0F172A"/></a:solidFill></a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr><c:showLegendKey val="0"/><c:showVal val="1"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/></c:dLbls>'
+    ax_tx = '<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="850"><a:solidFill><a:srgbClr val="334155"/></a:solidFill></a:defRPr></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr>'
+    is_bar = "bar" in ct_mode and "col" not in ct_mode
+    is_line_only = "line" in ct_mode and not sec_s
+    p_ser_str = "".join(_ser_xml(i, s[0], s[1], s[2], is_line=is_line_only) for i, s in enumerate(pri_s))
+    if is_line_only:
+        pri_plot = f'<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>{p_ser_str}{dlbls}<c:axId val="101"/><c:axId val="102"/></c:lineChart>'
+    else:
+        bdir = "bar" if is_bar else "col"
+        pri_plot = f'<c:barChart><c:barDir val="{bdir}"/><c:grouping val="clustered"/><c:varyColors val="0"/>{p_ser_str}{dlbls}<c:gapWidth val="160"/><c:overlap val="-15"/><c:axId val="101"/><c:axId val="102"/></c:barChart>'
+    cat_pos, val_pos = ("l", "b") if is_bar else ("b", "l")
+    axes_xml = (
+        f'<c:catAx><c:axId val="101"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="{cat_pos}"/><c:numFmt formatCode="General" sourceLinked="1"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="low"/>{ax_tx}<c:spPr><a:ln w="9525"><a:solidFill><a:srgbClr val="CBD5E1"/></a:solidFill></a:ln></c:spPr><c:crossAx val="102"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/></c:catAx>'
+        f'<c:valAx><c:axId val="102"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="{val_pos}"/><c:majorGridlines><c:spPr><a:ln w="6350"><a:solidFill><a:srgbClr val="E2E8F0"/></a:solidFill></a:ln></c:spPr></c:majorGridlines><c:numFmt formatCode="{html.escape(str(number_format or "General"))}" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>{ax_tx}<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="101"/><c:crosses val="autoZero"/><c:crossBetween val="between"/></c:valAx>'
+    )
+    sec_plot = ""
+    if sec_s:
+        s_ser_str = "".join(_ser_xml(len(pri_s)+j, s[0], s[1], s[2], is_line=True) for j, s in enumerate(sec_s))
+        sec_plot = f'<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>{s_ser_str}{dlbls}<c:axId val="103"/><c:axId val="104"/></c:lineChart>'
+        axes_xml += (
+            f'<c:catAx><c:axId val="103"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="1"/><c:axPos val="b"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="none"/><c:crossAx val="104"/><c:crosses val="autoZero"/><c:auto val="1"/></c:catAx>'
+            f'<c:valAx><c:axId val="104"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="r"/><c:numFmt formatCode="General" sourceLinked="0"/><c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>{ax_tx}<c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr><c:crossAx val="103"/><c:crosses val="max"/><c:crossBetween val="between"/></c:valAx>'
+        )
+    leg_xml = f'<c:legend><c:legendPos val="t"/><c:overlay val="0"/>{ax_tx}</c:legend>' if show_legend else ''
+    c_xml = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><c:chartSpace xmlns:c="{C_NS}" xmlns:a="{A_NS}" xmlns:r="{R_NS}"><c:roundedCorners val="0"/><c:chart><c:autoTitleDeleted val="1"/><c:plotArea><c:layout/>{pri_plot}{sec_plot}{axes_xml}</c:plotArea>{leg_xml}<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr></c:chartSpace>'
+    prs._charts.append((c_idx, c_xml.encode("utf-8")))
+    return gf
 ```

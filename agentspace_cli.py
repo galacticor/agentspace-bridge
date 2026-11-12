@@ -26,8 +26,63 @@ import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_XSRF_PATH = os.path.join(SCRIPT_DIR, "agentspace_xsrf.json")
+LOCAL_CONFIG_JSON_PATH = os.path.join(SCRIPT_DIR, "agentspace_local.json")
+LOCAL_ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
 AUTH_PROFILE_DIR = os.path.join(SCRIPT_DIR, ".auth_profile")
 OUTPUTS_DIR = os.path.join(SCRIPT_DIR, "outputs")
+
+
+def _load_local_personal_config() -> dict:
+    """
+    Loads git-ignored personal configuration from `./.env` and `./agentspace_local.json`
+    into `os.environ` (without overwriting existing shell env vars).
+    """
+    local_cfg: dict = {}
+    if os.path.isfile(LOCAL_ENV_PATH):
+        try:
+            with open(LOCAL_ENV_PATH, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and v:
+                        os.environ.setdefault(k, v)
+        except Exception:
+            pass
+
+    if os.path.isfile(LOCAL_CONFIG_JSON_PATH):
+        try:
+            with open(LOCAL_CONFIG_JSON_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                local_cfg = loaded
+                json_to_env = {
+                    "employee_id": "AGENTSPACE_EMPLOYEE_ID",
+                    "csesidx": "AGENTSPACE_CSESIDX",
+                    "entry_url": "AGENTSPACE_ENTRY_URL",
+                    "config_id": "AGENTSPACE_CONFIG_ID",
+                    "model": "AGENTSPACE_MODEL",
+                    "thinking": "AGENTSPACE_THINKING",
+                    "browser": "AGENTSPACE_BROWSER",
+                    "onedrive_drive_id": "AGENTSPACE_ONEDRIVE_DRIVE_ID",
+                    "onedrive_parent_id": "AGENTSPACE_ONEDRIVE_PARENT_ID",
+                    "onedrive_drive_name": "AGENTSPACE_ONEDRIVE_DRIVE_NAME",
+                    "onedrive_folder_name": "AGENTSPACE_ONEDRIVE_FOLDER_NAME",
+                    "onedrive_folder_url": "AGENTSPACE_ONEDRIVE_FOLDER_URL",
+                }
+                for jk, env_k in json_to_env.items():
+                    val = loaded.get(jk)
+                    if val is not None and str(val).strip():
+                        os.environ.setdefault(env_k, str(val).strip())
+        except Exception:
+            pass
+    return local_cfg
+
+
+LOCAL_PERSONAL_CONFIG = _load_local_personal_config()
 AGENTSPACE_ENTRY_URL = os.environ.get("AGENTSPACE_ENTRY_URL", "https://agentspace.ioh.co.id")
 WIDGET_CONFIG_ID = os.environ.get("AGENTSPACE_CONFIG_ID", "384c42b0-2885-415a-82d5-f2babc063b6e")
 DEFAULT_CSESIDX = os.environ.get("AGENTSPACE_CSESIDX", "")

@@ -240,7 +240,7 @@ agentspace-bridge/
 
 ## 8. Configuration & Environment Variables
 
-All defaults work out-of-the-box for IOH employees. You can optionally override settings via environment variables (see [`.env.example`](.env.example)):
+All defaults work out-of-the-box for IOH employees. For personal settings (such as your employee ID, `csesidx`, or personal OneDrive folder IDs), `agentspace_cli.py` automatically loads **`./.env`** and **`./agentspace_local.json`** (both are git-ignored so your personal info is never committed). See [`.env.example`](.env.example) and [`agentspace_local.example.json`](agentspace_local.example.json):
 
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |

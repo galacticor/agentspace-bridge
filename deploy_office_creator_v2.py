@@ -7,7 +7,15 @@ from agentspace_cli import get_agent, update_agent_from_file
 V2_AGENT_ID = "2291045905737541211"
 
 # 1. Load baseline from office_creator_v2_created.json
-created = json.loads(Path("office_creator_v2_created.json").read_text(encoding="utf-8"))
+import os
+raw_created_txt = Path("office_creator_v2_created.json").read_text(encoding="utf-8")
+if os.environ.get("AGENTSPACE_ONEDRIVE_DRIVE_ID"):
+    raw_created_txt = raw_created_txt.replace("<YOUR_ONEDRIVE_DRIVE_ID>", os.environ["AGENTSPACE_ONEDRIVE_DRIVE_ID"])
+if os.environ.get("AGENTSPACE_ONEDRIVE_PARENT_ID"):
+    raw_created_txt = raw_created_txt.replace("<YOUR_ONEDRIVE_FOLDER_ID>", os.environ["AGENTSPACE_ONEDRIVE_PARENT_ID"])
+if os.environ.get("AGENTSPACE_EMPLOYEE_ID"):
+    raw_created_txt = raw_created_txt.replace("<employee_id>", os.environ["AGENTSPACE_EMPLOYEE_ID"])
+created = json.loads(raw_created_txt)
 created_agent = created["agent"] if "agent" in created else created
 nodes = created_agent["lowCodeAgentDefinition"]["nodes"]
 

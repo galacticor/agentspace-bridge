@@ -12,6 +12,8 @@ getoxsrf*
 .env
 .env.*
 !.env.example
+agentspace_local.json
+!agentspace_local.example.json
 __pycache__/
 *.pyc
 .DS_Store

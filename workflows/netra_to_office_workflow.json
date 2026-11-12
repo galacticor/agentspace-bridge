@@ -3,8 +3,6 @@
     "name": "8458183310708652909",
     "displayName": "Netra to Office File Creator Workflow",
     "description": "End-to-end multi-agent pipeline: Netra queries live IOH marts -> Human-in-the-loop approval -> Condition routing (PPTX vs XLSX) -> Office File Creator builds executive deliverables.",
-    "createTime": "2026-10-24T22:04:13.140739Z",
-    "updateTime": "2026-10-25T04:41:53.888143105Z",
     "state": "PRIVATE",
     "sharingConfig": {
       "scope": "PRIVATE"
@@ -149,9 +147,8 @@
           }
         ]
       },
-            "triggerNodeId": "manual_trigger"
+      "triggerNodeId": "manual_trigger"
     },
-    "activeRevision": "8458183310708652909/revisions/10993483651066342887",
     "agentIdentityInfo": {},
     "observabilityConfig": {
       "observabilityEnabled": true

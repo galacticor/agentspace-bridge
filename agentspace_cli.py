@@ -393,6 +393,19 @@ def load_xsrf() -> tuple[dict, str]:
         "  - ~/Downloads/json.txt (or ~/Downloads/getoxsrf*)"
     )
 
+def resolve_csesidx(csesidx: str | None = None) -> str:
+    """Returns explicit csesidx if provided, or reads the user's csesidx from ./agentspace_xsrf.json."""
+    if csesidx:
+        return str(csesidx)
+    try:
+        xsrf, _ = load_xsrf()
+        if xsrf.get("csesidx"):
+            return str(xsrf["csesidx"])
+    except Exception:
+        pass
+    return DEFAULT_CSESIDX
+
+
 
 def b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -1062,7 +1075,7 @@ def list_workflows(csesidx: str = DEFAULT_CSESIDX) -> list[dict]:
                 flow = wf_def.get("agentFlow", {})
                 nodes = flow.get("nodes", [])
                 edges = flow.get("edges", [])
-                builder_url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{raw_id}?csesidx={csesidx}"
+                builder_url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{raw_id}?csesidx={resolve_csesidx(csesidx)}"
                 workflows.append({
                     "agent_id": raw_id,
                     "name": ag.get("name", a.get("name", "")),
@@ -1265,7 +1278,7 @@ def upsert_netra_office_workflow(
 
     saved_ag = res.get("agent", res) if isinstance(res, dict) else {}
     target_id = normalize_session_id(saved_ag.get("name", agent_id))
-    builder_url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{target_id}?csesidx={csesidx}"
+    builder_url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{target_id}?csesidx={resolve_csesidx(csesidx)}"
     return {
         "agent": saved_ag,
         "workflow_id": target_id,
@@ -2233,10 +2246,20 @@ def ask_agentspace(
             break
         action_args = dict(pending_action.get("args", {}) or {})
         if pending_action.get("actionName") == "onedrive_agent__upload_file":
-            action_args.setdefault("driveId", "<YOUR_ONEDRIVE_DRIVE_ID>")
-            action_args.setdefault("DriveName", "OneDrive - Indosat Ooredoo Hutchison")
-            action_args.setdefault("ParentId", "<onedrive_folder_id>")
-            action_args.setdefault("ParentName", "Agentspace_Exports")
+            env_drive_id = os.environ.get("AGENTSPACE_ONEDRIVE_DRIVE_ID", "").strip()
+            env_parent_id = os.environ.get("AGENTSPACE_ONEDRIVE_PARENT_ID", "").strip()
+            if env_drive_id:
+                action_args.setdefault("driveId", env_drive_id)
+            action_args.setdefault(
+                "DriveName",
+                os.environ.get("AGENTSPACE_ONEDRIVE_DRIVE_NAME", "OneDrive - Indosat Ooredoo Hutchison"),
+            )
+            if env_parent_id:
+                action_args.setdefault("ParentId", env_parent_id)
+            action_args.setdefault(
+                "ParentName",
+                os.environ.get("AGENTSPACE_ONEDRIVE_FOLDER_NAME", "Agentspace_Exports"),
+            )
             action_args.setdefault("FileName", "presentation.pptx")
             action_args.setdefault("InputFileName", action_args["FileName"])
             if str(action_args.get("InputFileName", "")).endswith(".txt") and not action_args.get("ContentBytes"):
@@ -2780,7 +2803,7 @@ def main():
                 print(
                     f"Successfully synced workflow: {ag.get('displayName')} ({normalize_session_id(ag.get('name', ''))})\n"
                     f"  Nodes: {len(flow.get('nodes', []))} | Edges: {len(flow.get('edges', []))}\n"
-                    f"  Canvas URL: {ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{normalize_session_id(ag.get('name', ''))}?csesidx={args.csesidx}"
+                    f"  Canvas URL: {ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/agent-flow-builder/{normalize_session_id(ag.get('name', ''))}?csesidx={resolve_csesidx(args.csesidx)}"
                 )
             return
 

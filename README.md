@@ -32,6 +32,8 @@ Use **IOH Agentspace Bridge** strictly for tasks requiring **IOH enterprise data
 3. **IOH Executive Presentations & Deliverables (`.pptx`, `.xlsx`, `.docx`)**:
    - **Mode 3A (Default — Hybrid Pipeline)**: Extract a complete, quantitative slide-by-slide Markdown outline from Netra/Search (`-o pptx_outline.md --summary-only`), then delegate the `.pptx` build and M365 Visual QA to a local Antigravity subagent.
    - **Mode 3B (On-Demand — Agentspace Build)**: Generate slides, spreadsheets, or memos directly inside Agentspace via `--agent office-workflow-suite` (`--agent slides`) or `--agent office-creator-2` and export native `.pptx`/`.pdf` locally at zero LLM token cost.
+4. **Agentspace Advisor Mode (`--model gemini-4-argon` / `gemini-4-carbon`, `--thinking HIGH`)**:
+   - When Antigravity is running a lighter local model (e.g., Hydrogen) and needs deep architectural reasoning, multi-file refactoring plans, or complex root-cause debugging, attach local files via `-f <path>` and save an actionable implementation plan to disk via `-o advisor_plan.md --summary-only`.
 
 ---
 
@@ -170,6 +172,15 @@ python agentspace_cli.py --finish-task <SESSION_TAG>
 python agentspace_cli.py --cleanup-media-sessions
 ```
 
+### E. Agentspace Advisor Mode (`--model gemini-4-argon` / `gemini-4-carbon`, `--thinking HIGH`)
+When Antigravity is running a lighter local model (e.g., Hydrogen) and needs deep architectural reasoning, multi-file refactoring plans, or complex root-cause debugging:
+1. Attach local files directly via `-f <path>` (never paste large codeblocks into the prompt).
+2. Pass `--model gemini-4-argon` (or `gemini-4-carbon`), `--thinking HIGH`, and `--session-tag <8_char_conv_id>`.
+3. Save the resulting implementation plan to disk via `-o advisor_plan.md --summary-only` and execute it locally in Antigravity:
+```powershell
+python agentspace_cli.py "Review the attached files and produce a step-by-step implementation plan with exact file paths, function signatures, edge cases, and verification steps." --model gemini-4-argon --thinking HIGH -f path/to/file1.py -f path/to/file2.py -o advisor_plan.md --session-tag mytask01 --summary-only
+```
+
 ---
 
 ## 5. MCP Server Tools (Inside Antigravity)
@@ -209,8 +220,15 @@ The repository includes an optional Chrome/Edge Extension (`./chrome_extension/`
 
 ```text
 agentspace-bridge/
-├── .agents/skills/ioh-agentspace/
-│   └── SKILL.md                  # Antigravity skill instructions (auto-linked by setup_mcp.py)
+├── .agents/skills/
+│   ├── ioh-agentspace/SKILL.md       # Antigravity skill instructions (auto-linked by setup_mcp.py)
+│   └── agentspace-advisor/SKILL.md   # Advisor Mode skill (Hydrogen executor + Argon/Carbon architect)
+├── knowledge_base/                   # Structured repository documentation (architecture, CLI, MCP, PPTX)
+│   ├── README.md
+│   ├── 01_architecture_and_auth.md
+│   ├── 02_cli_and_workflows.md
+│   ├── 03_mcp_and_skills.md
+│   └── 04_pptx_and_chrome_extension.md
 ├── chrome_extension/             # Unpacked Chrome/Edge extension for 1-click Native PPTX export
 │   ├── manifest.json
 │   ├── content.js

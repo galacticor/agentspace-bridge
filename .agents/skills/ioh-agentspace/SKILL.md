@@ -24,6 +24,7 @@ This skill connects Antigravity to **IOH's Gemini Enterprise (Agentspace)** via 
 >   1. **IOH Enterprise Data Agents (`--agent netra`, `--agent ace`)**: Live subscriber, CVM, revenue, and network analytics queries in IOH's GCP environment.
 >   2. **IOH Enterprise Knowledge Base Search (`--search`)**: Internal IOH Confluence, Jira (`DSB2C-*`), SharePoint, OneDrive, and ServiceNow lookups.
 >   3. **IOH Executive Presentations (`Mode 3A` Default vs. `Mode 3B` On-Demand)**: Extracting IOH data outlines for local `.pptx` builds (`Mode 3A`), or running your configured **`office-workflow-suite` Skill Agent (`14950672669329422296`)** when you explicitly ask Agentspace to create the slides (`Mode 3B`).
+>   4. **Agentspace Advisor Mode (`--model gemini-4-argon` / `gemini-4-carbon`, `--thinking HIGH`, `-f <file>`)**: When Antigravity is running a lighter local model (e.g., Hydrogen) and needs deep architectural planning or complex debugging, attach local files directly from disk via `-f <file_path>` and save the implementation plan via `-o advisor_plan.md --summary-only` (see `.agents/skills/agentspace-advisor/SKILL.md`). Keep trivial local edits and routine unit-test loops 100% local.
 
 ---
 

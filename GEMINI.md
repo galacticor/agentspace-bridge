@@ -14,6 +14,9 @@ Use **IOH Agentspace** strictly for tasks that require **IOH enterprise data, IO
 3. **IOH Executive Presentations (`.pptx`) — 3A Default vs. 3B On-Demand**:
    - **Mode 3A (Default — Hybrid Pipeline):** Query Agentspace (`--agent netra` or `--search`) to extract IOH data into an exhaustive slide-by-slide Markdown outline (`-o slide_outline.md --summary-only`), then build the `.pptx` **locally via a delegated Antigravity subagent** (`executive-slides` + `minimal-slides` + `pptx` / `pptxgenjs` + M365 Visual QA via `office_view_hook.py`). *(Note: If the presentation uses purely local files already on disk and needs zero IOH data, skip Agentspace completely and build locally!)*
    - **Mode 3B (When User Explicitly Requests Agentspace to Create Slides):** Invoke the user's configured **`office-workflow-suite` Skill Agent (`14950672669329422296`)** via `--agent office-workflow-suite` (or `--agent slides`), which loads `office-workflow-suite` (`references/executive-slides.md` and `references/minimal-slides.md`) inside Agentspace and auto-exports the native `.pptx` via `widgetExportImmersiveArtifact`.
+4. **Agentspace Advisor Mode (`--model gemini-4-argon` / `gemini-4-carbon`, `--thinking HIGH`, `-f <file>`)**:
+   - When Antigravity is constrained to a lighter local model (e.g., Hydrogen) and faces complex architecture, multi-file refactoring, or hard root-cause debugging, use Agentspace as an **external Senior Architect / Advisor** (`agentspace_cli.py --model gemini-4-argon --thinking HIGH -f <file1> -f <file2> -o advisor_plan.md --summary-only --session-tag <8_char_conv_id>`).
+   - **Zero Output-Token Context Sharing:** Always pass local files via `-f <path>` (never paste large codeblocks into the prompt) and save the resulting implementation plan to disk via `-o advisor_plan.md --summary-only`, then execute the plan locally in Antigravity. Keep trivial local edits, simple lint fixes, and routine unit-test loops 100% local.
 
 ---
 

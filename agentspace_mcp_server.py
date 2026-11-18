@@ -6,8 +6,11 @@ Allows Google Antigravity to offload queries, code generation, Netra/ACE agent q
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import os
 import sys
+import threading
 from agentspace_cli import (
     ask_agentspace,
     cleanup_media_sessions,
@@ -23,14 +26,20 @@ from agentspace_cli import (
     DEFAULT_CSESIDX,
 )
 
+_MAX_MCP_WORKERS = max(2, int(os.environ.get("AGENTSPACE_MCP_WORKERS", "6")))
+_STDOUT_LOCK = threading.Lock()
+_PROTO_STDOUT = sys.stdout
+
 TOOLS = [
     {
         "name": "agentspace_ask",
         "description": (
-            "Query IOH's Gemini Enterprise (Agentspace) for tasks requiring IOH enterprise data or internal knowledge: "
-            "(1) specialized IOH data agents ('netra', 'ace'), (2) internal IOH enterprise search connectors "
-            "(Confluence, SharePoint, Jira, OneDrive, ServiceNow), or (3) IOH executive presentations "
-            "('office-workflow-suite' / 'slides' / 'office-creator'). Do NOT use this tool to offload general local coding."
+            "Query IOH's Gemini Enterprise (Agentspace) ONLY when the task requires: "
+            "(1) specialized IOH data agents ('netra', 'ace'), (2) internal @ioh.co.id enterprise search connectors "
+            "(Confluence, SharePoint, Jira, OneDrive, ServiceNow via enable_enterprise_search=True), or "
+            "(3) executive deliverables ('office-workflow-suite' / 'slides' / 'office-creator' / python_pptx=True). "
+            "ROUTING RULE: Keep mechanical file edits, grep, and shell/test execution in Antigravity's native harness; "
+            "use `agentspace_advise` instead for multi-file architectural or SQL planning."
         ),
         "inputSchema": {
             "type": "object",
@@ -119,6 +128,71 @@ TOOLS = [
                 },
             },
             "required": ["prompt"],
+        },
+    },
+    {
+        "name": "agentspace_advise",
+        "description": (
+            "Advisor Planner Mode: delegate complex multi-file architecture, concurrency/refactoring plans, "
+            "heavy BigQuery SQL design, or root-cause synthesis to Gemini 4 Carbon (HIGH thinking) while keeping "
+            "a fast/low-quota native model in Antigravity as Executor. Attaches a compact repo tree + every relevant "
+            "local file via `files` (attach config/setup/doc files upfront to avoid `[NEED_CONTEXT]` round-trips) "
+            "and saves an Implementation Manifest to `./outputs/<session_tag>/`. For parallel subagents, pass "
+            "distinct `session_tag` suffixes or `new_session=True`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The architectural, refactoring, or debugging task to plan.",
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of file paths, directories, or glob patterns to attach from disk.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional project root directory for resolving relative paths and building the repo tree.",
+                },
+                "include_tree": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Attach a compact repo file tree so the Advisor knows what files exist (default: true).",
+                },
+                "model": {
+                    "type": "string",
+                    "default": "gemini-4-carbon",
+                    "description": "Advisor model ID ('gemini-4-carbon' or 'gemini-4-argon').",
+                },
+                "thinking_level": {
+                    "type": "string",
+                    "enum": ["LOW", "MEDIUM", "HIGH", "NONE"],
+                    "default": "HIGH",
+                    "description": "Thinking effort level (default: HIGH).",
+                },
+                "session_tag": {
+                    "type": "string",
+                    "description": "Antigravity conversation ID prefix (e.g. 'bba4da86') for session continuity.",
+                },
+                "new_session": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Force creating a brand-new Agentspace session.",
+                },
+                "output_filename": {
+                    "type": "string",
+                    "default": "advisor_plan.md",
+                    "description": "Filename to save the plan under ./outputs/<session_tag>/ (default: 'advisor_plan.md').",
+                },
+                "csesidx": {
+                    "type": "string",
+                    "default": DEFAULT_CSESIDX,
+                    "description": "Optional csesidx query parameter.",
+                },
+            },
+            "required": ["task"],
         },
     },
     {
@@ -279,10 +353,12 @@ def handle_request(msg: dict) -> dict | None:
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "ioh-agentspace-mcp", "version": "1.1.0"},
+                "serverInfo": {"name": "ioh-agentspace-mcp", "version": "1.2.0"},
             },
         }
-    elif method == "notifications/initialized":
+    elif method == "ping":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+    elif isinstance(method, str) and method.startswith("notifications/"):
         return None
     elif method == "tools/list":
         return {
@@ -347,6 +423,46 @@ def handle_request(msg: dict) -> dict | None:
                         else f"`{res['session']}`"
                     )
                     out_text += f"\n\n---\n_Agentspace Session: {status_note} (Target: `{res['model']}`)_"
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": out_text}],
+                        "isError": False,
+                    },
+                }
+
+            elif name == "agentspace_advise":
+                res = ask_agentspace(
+                    prompt=args["task"],
+                    model_id=args.get("model", "gemini-4-carbon"),
+                    thinking_level=args.get("thinking_level", "HIGH"),
+                    input_files=args.get("files"),
+                    save_output=True,
+                    output_filename=args.get("output_filename", "advisor_plan.md"),
+                    session_tag=args.get("session_tag"),
+                    new_session=bool(args.get("new_session", False)),
+                    csesidx=args.get("csesidx", DEFAULT_CSESIDX),
+                    include_tree=bool(args.get("include_tree", True)),
+                    advise_mode=True,
+                    cwd=args.get("cwd"),
+                )
+                preview = res["text"][:600]
+                if len(res["text"]) > 600:
+                    preview += "\n... [truncated to save AGY context tokens]"
+                need_ctx_note = (
+                    "\n\n**[NEED_CONTEXT] DETECTED:** The Advisor requested additional files/outputs. "
+                    "Read the saved plan, gather the requested context, and call `agentspace_advise` again with the same `session_tag`."
+                    if "[NEED_CONTEXT]" in res["text"]
+                    else ""
+                )
+                out_text = (
+                    f"Saved Advisor plan ({res['line_count']} lines, {res['char_count']} chars) to:\n"
+                    f"`{res.get('saved_output_path', '')}`{need_ctx_note}\n\n"
+                    f"**Preview:**\n{preview}"
+                )
+                if res.get("session"):
+                    out_text += f"\n\n---\n_Agentspace Session: `{res['session']}` (Target: `{res['model']}`)_"
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
@@ -478,9 +594,9 @@ def handle_request(msg: dict) -> dict | None:
                             "type": "text",
                             "text": (
                                 f"Error calling IOH Agentspace: {e}\n\n"
-                                "If the 1-hour XSRF session expired, download a fresh copy from:\n"
-                                "https://vertexaisearch.cloud.google/auth/getoxsrf?csesidx=<YOUR_CSESIDX>\n"
-                                "into ~/Downloads/json.txt or %TEMP%/agentspace_xsrf.json"
+                                "Auto-refresh is locked via `.auth_profile/.refresh.lock`. If interactive Entra ID "
+                                "re-login is needed, call `agentspace_refresh_token` or run: "
+                                "`python3 agentspace_cli.py --refresh-token`"
                             ),
                         }
                     ],
@@ -496,20 +612,63 @@ def handle_request(msg: dict) -> dict | None:
     return None
 
 
-def main():
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+def _write_jsonrpc(resp: dict) -> None:
+    payload = json.dumps(resp) + "\n"
+    with _STDOUT_LOCK:
         try:
-            msg = json.loads(line)
-            resp = handle_request(msg)
-            if resp is not None:
-                sys.stdout.write(json.dumps(resp) + "\n")
-                sys.stdout.flush()
-        except Exception as e:
-            sys.stderr.write(f"MCP error: {e}\n")
-            sys.stderr.flush()
+            _PROTO_STDOUT.write(payload)
+            _PROTO_STDOUT.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+
+def _dispatch_tool_call(msg: dict) -> None:
+    msg_id = msg.get("id")
+    try:
+        resp = handle_request(msg)
+        if resp is not None:
+            _write_jsonrpc(resp)
+    except Exception as exc:
+        sys.stderr.write(f"MCP worker error: {exc}\n")
+        sys.stderr.flush()
+        if msg_id is not None:
+            _write_jsonrpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32603, "message": f"Internal MCP worker error: {exc}"},
+                }
+            )
+
+
+def main():
+    global _PROTO_STDOUT
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # Duplicate true OS FD 1 for JSON-RPC, then redirect FD 1 -> stderr so child subprocesses cannot pollute stdout
+    proto_fd = os.dup(sys.stdout.fileno())
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    _PROTO_STDOUT = os.fdopen(proto_fd, "w", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_MCP_WORKERS) as pool:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                if msg.get("method") == "tools/call":
+                    pool.submit(_dispatch_tool_call, msg)
+                else:
+                    resp = handle_request(msg)
+                    if resp is not None:
+                        _write_jsonrpc(resp)
+            except Exception as e:
+                sys.stderr.write(f"MCP error: {e}\n")
+                sys.stderr.flush()
 
 
 if __name__ == "__main__":

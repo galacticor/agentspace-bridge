@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import glob
 import hashlib
 import hmac
@@ -19,6 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,7 +31,158 @@ PROJECT_XSRF_PATH = os.path.join(SCRIPT_DIR, "agentspace_xsrf.json")
 LOCAL_CONFIG_JSON_PATH = os.path.join(SCRIPT_DIR, "agentspace_local.json")
 LOCAL_ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
 AUTH_PROFILE_DIR = os.path.join(SCRIPT_DIR, ".auth_profile")
+REFRESH_LOCK_PATH = os.path.join(AUTH_PROFILE_DIR, ".refresh.lock")
 OUTPUTS_DIR = os.path.join(SCRIPT_DIR, "outputs")
+
+_INTRA_PROCESS_LOCKS: dict[str, threading.Lock] = {}
+_INTRA_LOCKS_GUARD = threading.Lock()
+
+
+def _get_intra_process_lock(lock_path: str) -> threading.Lock:
+    norm = os.path.abspath(lock_path)
+    with _INTRA_LOCKS_GUARD:
+        lk = _INTRA_PROCESS_LOCKS.get(norm)
+        if lk is None:
+            lk = threading.Lock()
+            _INTRA_PROCESS_LOCKS[norm] = lk
+        return lk
+
+
+class _FileLock:
+    """Zero-dependency cross-process (fcntl/msvcrt) + intra-process (threading.Lock) file lock."""
+
+    def __init__(self, lock_path: str, blocking: bool = True, timeout_sec: float = 90.0) -> None:
+        self.lock_path = os.path.abspath(lock_path)
+        self.blocking = blocking
+        self.timeout_sec = max(0.1, float(timeout_sec))
+        self._thread_lock = _get_intra_process_lock(self.lock_path)
+        self._fh = None
+
+    def _try_os_lock(self) -> bool:
+        assert self._fh is not None
+        if sys.platform == "win32":
+            import msvcrt
+
+            self._fh.seek(0)
+            try:
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                return False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except (BlockingIOError, OSError):
+                return False
+
+    def _release_os_lock(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+    def __enter__(self) -> "_FileLock":
+        deadline = time.monotonic() + self.timeout_sec
+        acquired_thread = (
+            self._thread_lock.acquire(timeout=self.timeout_sec)
+            if self.blocking
+            else self._thread_lock.acquire(blocking=False)
+        )
+        if not acquired_thread:
+            if not self.blocking:
+                raise BlockingIOError(f"Lock busy (intra-process): {self.lock_path}")
+            raise TimeoutError(f"Timed out after {self.timeout_sec:.1f}s waiting for thread lock: {self.lock_path}")
+
+        try:
+            os.makedirs(os.path.dirname(self.lock_path) or ".", exist_ok=True)
+            try:
+                self._fh = open(self.lock_path, "r+b")
+            except FileNotFoundError:
+                self._fh = open(self.lock_path, "a+b")
+            if sys.platform == "win32":
+                self._fh.seek(0, os.SEEK_END)
+                if self._fh.tell() == 0:
+                    self._fh.write(b"0")
+                    self._fh.flush()
+
+            while True:
+                if self._try_os_lock():
+                    return self
+                if not self.blocking:
+                    raise BlockingIOError(f"Lock busy (OS): {self.lock_path}")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out after {self.timeout_sec:.1f}s waiting for file lock: {self.lock_path}")
+                time.sleep(0.15)
+        except Exception:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+            self._thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        try:
+            self._release_os_lock()
+        finally:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+            self._thread_lock.release()
+
+
+def _atomic_write_json(target_path: str, data: dict | list) -> None:
+    """Atomically writes JSON via same-directory temp file + fsync + os.replace."""
+    abs_target = os.path.abspath(target_path)
+    parent_dir = os.path.dirname(abs_target) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent_dir,
+            prefix=".tmp_",
+            suffix=".json",
+            delete=False,
+        ) as tf:
+            tmp_path = tf.name
+            json.dump(data, tf, indent=2)
+            tf.flush()
+            os.fsync(tf.fileno())
+        for rep_try in range(3):
+            try:
+                os.replace(tmp_path, abs_target)
+                break
+            except PermissionError:
+                if rep_try == 2:
+                    raise
+                time.sleep(0.05 * (rep_try + 1))
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
 
 
 def _load_local_personal_config() -> dict:
@@ -88,6 +241,7 @@ WIDGET_CONFIG_ID = os.environ.get("AGENTSPACE_CONFIG_ID", "384c42b0-2885-415a-82
 DEFAULT_CSESIDX = os.environ.get("AGENTSPACE_CSESIDX", "")
 DEFAULT_MODEL = os.environ.get("AGENTSPACE_MODEL", "gemini-4-argon")
 DEFAULT_THINKING = os.environ.get("AGENTSPACE_THINKING", "MEDIUM")
+DEFAULT_STREAM_TIMEOUT = int(os.environ.get("AGENTSPACE_STREAM_TIMEOUT", "300"))
 DEFAULT_BROWSER_CHANNEL = os.environ.get(
     "AGENTSPACE_BROWSER",
     "chrome" if sys.platform == "darwin" else "msedge",
@@ -357,75 +511,128 @@ def _attempt_xsrf_capture(
     return captured
 
 
+def _get_fresh_cached_xsrf(
+    stale_key_id: str | None = None,
+    min_saved_at: int | None = None,
+    call_started_at: int | None = None,
+) -> tuple[dict, str] | None:
+    """Checks whether another concurrent worker already refreshed the XSRF token on disk."""
+    try:
+        xsrf, path = load_xsrf()
+    except FileNotFoundError:
+        return None
+    saved_at = int(xsrf.get("savedAt") or 0)
+    if stale_key_id and xsrf.get("keyId") and str(xsrf.get("keyId")) != str(stale_key_id):
+        return xsrf, path
+    if min_saved_at is not None and saved_at >= min_saved_at:
+        return xsrf, path
+    if stale_key_id is None and min_saved_at is None and call_started_at is not None and saved_at > call_started_at:
+        return xsrf, path
+    return None
+
+
 def refresh_xsrf_token(
     csesidx: str | None = None,
     browser_channel: str = DEFAULT_BROWSER_CHANNEL,
     timeout_sec: int = 180,
     headless_first: bool = True,
+    stale_key_id: str | None = None,
+    min_saved_at: int | None = None,
 ) -> tuple[dict, str]:
     """
-    Refreshes the IOH Agentspace XSRF token using a persistent Work profile in .auth_profile/.
-    - If .auth_profile/ already has a saved login session and headless_first=True, first attempts
-      a silent 15s headless refresh so no popup window interrupts the user.
-    - If first-time setup or SSO requires interactive login/2FA, opens a visible browser window.
+    Refreshes the IOH Agentspace XSRF token using a persistent Work profile in .auth_profile/,
+    serialized across threads and OS processes via REFRESH_LOCK_PATH.
     """
+    call_started_at = int(time.time())
+    pre_cached = _get_fresh_cached_xsrf(stale_key_id=stale_key_id, min_saved_at=min_saved_at)
+    if pre_cached is not None:
+        return pre_cached
+
+    target_save_path = (
+        os.path.abspath(os.environ["AGENTSPACE_XSRF_PATH"])
+        if os.environ.get("AGENTSPACE_XSRF_PATH")
+        else PROJECT_XSRF_PATH
+    )
+
+    # Resolve Playwright interpreter BEFORE acquiring OS REFRESH_LOCK_PATH so child `alt_py` never deadlocks,
+    # but serialize threads inside this process via _get_intra_process_lock so only 1 `alt_py` spawns.
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         alt_py = _find_playwright_python()
         if alt_py:
-            cmd = [
-                alt_py,
-                os.path.abspath(__file__),
-                "--refresh-token",
-                "--browser",
-                browser_channel,
-                "--json",
-            ]
-            if csesidx:
-                cmd.extend(["--csesidx", csesidx])
-            subprocess.run(cmd, check=True)
-            return load_xsrf()
+            with _get_intra_process_lock(REFRESH_LOCK_PATH):
+                cached = _get_fresh_cached_xsrf(
+                    stale_key_id=stale_key_id,
+                    min_saved_at=min_saved_at,
+                    call_started_at=call_started_at,
+                )
+                if cached is not None:
+                    return cached
+                cmd = [
+                    alt_py,
+                    os.path.abspath(__file__),
+                    "--refresh-token",
+                    "--browser",
+                    browser_channel,
+                    "--json",
+                ]
+                if csesidx:
+                    cmd.extend(["--csesidx", csesidx])
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+                return load_xsrf()
         raise
 
-    has_existing_profile = os.path.isdir(os.path.join(AUTH_PROFILE_DIR, "Default"))
-    captured: dict = {}
+    with _FileLock(REFRESH_LOCK_PATH, blocking=True, timeout_sec=timeout_sec + 35):
+        cached = _get_fresh_cached_xsrf(
+            stale_key_id=stale_key_id,
+            min_saved_at=min_saved_at,
+            call_started_at=call_started_at,
+        )
+        if cached is not None:
+            print(
+                f"[Agentspace Auth] Reusing token refreshed by peer worker (keyId={cached[0].get('keyId')}) from {cached[1]}",
+                file=sys.stderr,
+            )
+            return cached
 
-    with sync_playwright() as p:
-        if headless_first and has_existing_profile:
-            try:
+        has_existing_profile = os.path.isdir(os.path.join(AUTH_PROFILE_DIR, "Default"))
+        captured: dict = {}
+
+        with sync_playwright() as p:
+            if headless_first and has_existing_profile:
+                try:
+                    captured = _attempt_xsrf_capture(
+                        p,
+                        csesidx=csesidx,
+                        browser_channel=browser_channel,
+                        headless=True,
+                        timeout_sec=25,
+                    )
+                except Exception:
+                    captured = {}
+
+            if not captured:
                 captured = _attempt_xsrf_capture(
                     p,
                     csesidx=csesidx,
                     browser_channel=browser_channel,
-                    headless=True,
-                    timeout_sec=25,
+                    headless=False,
+                    timeout_sec=timeout_sec,
                 )
-            except Exception:
-                captured = {}
 
         if not captured:
-            captured = _attempt_xsrf_capture(
-                p,
-                csesidx=csesidx,
-                browser_channel=browser_channel,
-                headless=False,
-                timeout_sec=timeout_sec,
+            raise RuntimeError(
+                f"Timed out after {timeout_sec}s waiting for Agentspace SSO login and XSRF token."
             )
 
-    if not captured:
-        raise RuntimeError(
-            f"Timed out after {timeout_sec}s waiting for Agentspace SSO login and XSRF token."
+        captured["savedAt"] = max(int(captured.get("savedAt") or time.time()), int(min_saved_at or 0), call_started_at + 1)
+        _atomic_write_json(target_save_path, captured)
+        print(
+            f"[Agentspace Auth] Saved fresh token (keyId={captured.get('keyId')}, csesidx={captured.get('csesidx')}) to {target_save_path}",
+            file=sys.stderr,
         )
-
-    with open(PROJECT_XSRF_PATH, "w", encoding="utf-8") as f:
-        json.dump(captured, f, indent=2)
-
-    print(
-        f"[Agentspace Auth] Saved fresh token (keyId={captured.get('keyId')}, csesidx={captured.get('csesidx')}) to {PROJECT_XSRF_PATH}",
-        file=sys.stderr,
-    )
-    return captured, PROJECT_XSRF_PATH
+        return captured, target_save_path
 
 
 def load_xsrf() -> tuple[dict, str]:
@@ -549,7 +756,7 @@ def _post_widget_rpc(
     except FileNotFoundError:
         if not auto_refresh:
             raise
-        xsrf, xsrf_path = refresh_xsrf_token(csesidx=csesidx)
+        xsrf, xsrf_path = refresh_xsrf_token(csesidx=csesidx, min_saved_at=int(time.time()) - 5)
 
     for attempt in range(2):
         effective_csesidx = str(xsrf.get("csesidx") or csesidx)
@@ -593,11 +800,17 @@ def _post_widget_rpc(
                     raise
         except urllib.error.HTTPError as e:
             if e.code in (401, 403) and auto_refresh and attempt == 0:
+                stale_kid = str(xsrf.get("keyId") or "")
+                next_min_ts = int(xsrf.get("savedAt") or 0) + 1
                 print(
-                    f"[Agentspace Auth] Token in {xsrf_path} expired (HTTP {e.code}). Launching browser UI to refresh...",
+                    f"[Agentspace Auth] Token in {xsrf_path} expired (HTTP {e.code}, keyId={stale_kid}). Refreshing under lock...",
                     file=sys.stderr,
                 )
-                xsrf, xsrf_path = refresh_xsrf_token(csesidx=csesidx)
+                xsrf, xsrf_path = refresh_xsrf_token(
+                    csesidx=csesidx,
+                    stale_key_id=stale_kid or None,
+                    min_saved_at=next_min_ts if next_min_ts > 1 else int(time.time()),
+                )
                 continue
             raise
     raise RuntimeError("Unreachable RPC retry state")
@@ -774,19 +987,20 @@ def clear_reusable_session(
     mode_key: str,
     deleted_session_id: str | None = None,
 ) -> None:
-    state, state_path = _load_session_state(session_tag)
+    state_path = _get_session_state_path(session_tag)
     if not state_path:
         return
-    state["sessions"].pop(mode_key, None)
-    state["prompt_counts"].pop(mode_key, None)
-    if deleted_session_id:
-        short_del = normalize_session_id(deleted_session_id)
-        state["media_sessions"] = [
-            s for s in state.get("media_sessions", []) if normalize_session_id(s) != short_del
-        ]
-    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+    with _FileLock(f"{state_path}.lock", blocking=True, timeout_sec=15):
+        state, _ = _load_session_state(session_tag)
+        state["sessions"].pop(mode_key, None)
+        state["prompt_counts"].pop(mode_key, None)
+        if deleted_session_id:
+            short_del = normalize_session_id(deleted_session_id)
+            state["media_sessions"] = [
+                s for s in state.get("media_sessions", []) if normalize_session_id(s) != short_del
+            ]
+        state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _atomic_write_json(state_path, state)
 
 
 def save_reusable_session(
@@ -796,34 +1010,37 @@ def save_reusable_session(
     display_name: str | None = None,
     prompt_count: int | None = None,
     is_media: bool = False,
+    update_active_slot: bool = True,
 ) -> int:
-    state, state_path = _load_session_state(session_tag)
+    state_path = _get_session_state_path(session_tag)
     if not state_path or not session_name:
         return 0
-    prev_sess = state["sessions"].get(mode_key)
-    short_new = normalize_session_id(session_name)
-    short_prev = normalize_session_id(prev_sess) if prev_sess else None
+    with _FileLock(f"{state_path}.lock", blocking=True, timeout_sec=15):
+        state, _ = _load_session_state(session_tag)
+        prev_sess = state["sessions"].get(mode_key)
+        short_new = normalize_session_id(session_name)
+        short_prev = normalize_session_id(prev_sess) if prev_sess else None
 
-    if prompt_count is not None:
-        new_count = prompt_count
-    elif short_prev == short_new:
-        new_count = int(state["prompt_counts"].get(mode_key, 0)) + 1
-    else:
-        new_count = 1
+        if prompt_count is not None:
+            new_count = prompt_count
+        elif short_prev == short_new:
+            new_count = int(state["prompt_counts"].get(mode_key, 0)) + 1
+        else:
+            new_count = 1
 
-    state["sessions"][mode_key] = session_name
-    state["prompt_counts"][mode_key] = new_count
-    if is_media or ":media" in mode_key:
-        if short_new not in [normalize_session_id(x) for x in state["media_sessions"]]:
-            state["media_sessions"].append(short_new)
-    if short_new not in [normalize_session_id(x) for x in state["history"]]:
-        state["history"].append(short_new)
-    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    if display_name:
-        state["last_display_name"] = display_name
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-    return new_count
+        if update_active_slot:
+            state["sessions"][mode_key] = session_name
+            state["prompt_counts"][mode_key] = new_count
+        if is_media or ":media" in mode_key:
+            if short_new not in [normalize_session_id(x) for x in state["media_sessions"]]:
+                state["media_sessions"].append(short_new)
+        if short_new not in [normalize_session_id(x) for x in state["history"]]:
+            state["history"].append(short_new)
+        state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if display_name:
+            state["last_display_name"] = display_name
+        _atomic_write_json(state_path, state)
+        return new_count
 
 
 def finish_task_sessions(
@@ -857,38 +1074,38 @@ def finish_task_sessions(
         st_file = os.path.join(d_path, "session_state.json")
         is_sub_asset_dir = os.path.basename(d_path) != clean_base
         if os.path.isfile(st_file):
-            try:
-                with open(st_file, "r", encoding="utf-8") as f:
-                    st = json.load(f)
-            except Exception:
-                st = {}
-            sess_map = st.get("sessions", {}) if isinstance(st.get("sessions"), dict) else {}
-            media_list = st.get("media_sessions", []) if isinstance(st.get("media_sessions"), list) else []
+            with _FileLock(f"{st_file}.lock", blocking=True, timeout_sec=15):
+                try:
+                    with open(st_file, "r", encoding="utf-8") as f:
+                        st = json.load(f)
+                except Exception:
+                    st = {}
+                sess_map = st.get("sessions", {}) if isinstance(st.get("sessions"), dict) else {}
+                media_list = st.get("media_sessions", []) if isinstance(st.get("media_sessions"), list) else []
 
-            for m_sess in media_list:
-                short_id = normalize_session_id(m_sess)
-                if short_id and short_id not in sessions_to_delete:
-                    sessions_to_delete.append(short_id)
-
-            for m_key, s_val in list(sess_map.items()):
-                if not s_val:
-                    continue
-                if (not media_only) or (":media" in m_key) or is_sub_asset_dir:
-                    short_id = normalize_session_id(s_val)
+                for m_sess in media_list:
+                    short_id = normalize_session_id(m_sess)
                     if short_id and short_id not in sessions_to_delete:
                         sessions_to_delete.append(short_id)
-                    sess_map.pop(m_key, None)
-                    if isinstance(st.get("prompt_counts"), dict):
-                        st["prompt_counts"].pop(m_key, None)
 
-            st["media_sessions"] = []
-            st["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            try:
-                with open(st_file, "w", encoding="utf-8") as f:
-                    json.dump(st, f, indent=2)
-                state_files_touched.append(st_file)
-            except Exception:
-                pass
+                for m_key, s_val in list(sess_map.items()):
+                    if not s_val:
+                        continue
+                    if (not media_only) or (":media" in m_key) or is_sub_asset_dir:
+                        short_id = normalize_session_id(s_val)
+                        if short_id and short_id not in sessions_to_delete:
+                            sessions_to_delete.append(short_id)
+                        sess_map.pop(m_key, None)
+                        if isinstance(st.get("prompt_counts"), dict):
+                            st["prompt_counts"].pop(m_key, None)
+
+                st["media_sessions"] = []
+                st["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                try:
+                    _atomic_write_json(st_file, st)
+                    state_files_touched.append(st_file)
+                except Exception:
+                    pass
 
         # Also check filenames in sub-asset folders (`chat_<tag>_img1__<ts>__<short_id>__...`)
         if is_sub_asset_dir:
@@ -1392,11 +1609,14 @@ def download_session_media_files(
         target_dir = os.path.join(OUTPUTS_DIR, tag)
     os.makedirs(target_dir, exist_ok=True)
 
+    def _make_dl_headers(curr_xsrf: dict) -> dict[str, str]:
+        eff_cses = str(curr_xsrf.get("csesidx") or csesidx)
+        hdrs = _build_browser_rpc_headers(make_jwt(curr_xsrf, csesidx=eff_cses))
+        hdrs.pop("Content-Type", None)
+        return hdrs
+
     xsrf, _ = load_xsrf()
-    effective_csesidx = str(xsrf.get("csesidx") or csesidx)
-    jwt_tok = make_jwt(xsrf, csesidx=effective_csesidx)
-    dl_headers = _build_browser_rpc_headers(jwt_tok)
-    dl_headers.pop("Content-Type", None)
+    dl_headers = _make_dl_headers(xsrf)
 
     out_prefix = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
     slug_part = f"__{_sanitize_slug(prompt_slug, 28)}" if prompt_slug else ""
@@ -1431,9 +1651,23 @@ def download_session_media_files(
         out_filename = f"{out_prefix}{short_sess}{slug_part}__{media_kind}{suffix_idx}{ext}"
         out_path = os.path.join(target_dir, out_filename)
 
-        req = urllib.request.Request(raw_uri, headers=dl_headers, method="GET")
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            file_bytes = resp.read()
+        file_bytes = b""
+        for dl_try in range(2):
+            req = urllib.request.Request(raw_uri, headers=dl_headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    file_bytes = resp.read()
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403) and dl_try == 0:
+                    xsrf, _ = refresh_xsrf_token(
+                        csesidx=csesidx,
+                        stale_key_id=str(xsrf.get("keyId") or "") or None,
+                        min_saved_at=int(xsrf.get("savedAt") or 0) + 1,
+                    )
+                    dl_headers = _make_dl_headers(xsrf)
+                    continue
+                raise
         with open(out_path, "wb") as f:
             f.write(file_bytes)
 
@@ -1990,7 +2224,7 @@ def _export_pdf_via_webui(
         pass
 
     url = f"{ORIGIN}/home/cid/{WIDGET_CONFIG_ID}/r/session/{short_sess}?csesidx={effective_csesidx}"
-    with sync_playwright() as p:
+    with _FileLock(REFRESH_LOCK_PATH, blocking=True, timeout_sec=150), sync_playwright() as p:
         ctx, _ = _launch_persistent_browser(
             p,
             browser_channel=browser_channel,
@@ -2075,8 +2309,136 @@ def build_scoped_output_path(
         slug = _sanitize_slug(prompt, max_len=32)
         ext = ".md"
 
-    filename = f"{tag}__{ts}__{short_as_id}__{slug}{ext}"
-    return os.path.join(session_dir, filename)
+    with _FileLock(os.path.join(session_dir, ".path_alloc.lock"), blocking=True, timeout_sec=5):
+        seq = 1
+        while True:
+            sfx = "" if seq == 1 else f"_{seq}"
+            filename = f"{tag}__{ts}__{short_as_id}__{slug}{sfx}{ext}"
+            candidate = os.path.join(session_dir, filename)
+            try:
+                fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd)
+                return candidate
+            except FileExistsError:
+                seq += 1
+_ADVISOR_IGNORED_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", ".auth_profile",
+    "outputs", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
+}
+_ADVISOR_BINARY_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".tar",
+    ".gz", ".mp4", ".mp3", ".wav", ".pptx", ".xlsx", ".docx", ".pyc", ".so",
+    ".dylib", ".dll", ".exe", ".bin", ".woff", ".woff2", ".ttf",
+}
+
+ADVISOR_SYSTEM_PREAMBLE = (
+    "You are acting as the **Senior Architect & Planner** for a smaller local Executor model "
+    "(e.g., Hydrogen or Flash Medium/High).\n"
+    "Produce a crisp, unambiguous **Implementation Manifest** and end every advisory turn with a "
+    "compact `<antigravity_spec>` block containing:\n"
+    "1. **Exact target file paths & line/function targets**.\n"
+    "2. **Exact SQL/Python logic changes or schema contracts** (precise diffs or replacement instructions).\n"
+    "3. **Edge cases & invariants** to preserve.\n"
+    "4. **Exact verification commands** (tests, syntax checks, dry-runs with `--tb=short` / `-q`).\n"
+    "CRITICAL: If you need additional files, schemas, or command outputs before finalizing the spec, "
+    "do NOT guess — list the exact paths or commands under a `[NEED_CONTEXT]` section and stop."
+)
+
+
+def _expand_input_paths(
+    paths: list[str],
+    cwd: str | None = None,
+    max_files: int = 40,
+    max_total_bytes: int = 300_000,
+) -> list[tuple[str, str]]:
+    """Expand file paths, directories, and glob patterns into (abs_path, display_rel_path) tuples."""
+    import glob as _glob
+
+    base_dir = os.path.abspath(cwd or os.getcwd())
+    collected: list[str] = []
+    seen: set[str] = set()
+
+    def _add_file(p: str) -> None:
+        ap = os.path.abspath(p)
+        if ap in seen or not os.path.isfile(ap):
+            return
+        ext = os.path.splitext(ap)[1].lower()
+        if ext in _ADVISOR_BINARY_EXTS:
+            return
+        seen.add(ap)
+        collected.append(ap)
+
+    for raw in paths:
+        candidate = raw if os.path.isabs(raw) else os.path.join(base_dir, raw)
+        if any(ch in raw for ch in ("*", "?", "[")):
+            for m in sorted(_glob.glob(candidate, recursive=True)):
+                if os.path.isfile(m):
+                    _add_file(m)
+        elif os.path.isdir(candidate):
+            for root, dirs, files in os.walk(candidate):
+                dirs[:] = sorted(d for d in dirs if d not in _ADVISOR_IGNORED_DIRS and not d.startswith("."))
+                for fn in sorted(files):
+                    if len(collected) >= max_files:
+                        break
+                    _add_file(os.path.join(root, fn))
+                if len(collected) >= max_files:
+                    break
+        elif os.path.isfile(candidate):
+            _add_file(candidate)
+        else:
+            raise FileNotFoundError(f"Input path not found: {candidate}")
+
+    result: list[tuple[str, str]] = []
+    total_bytes = 0
+    for ap in collected[:max_files]:
+        size = os.path.getsize(ap)
+        if total_bytes + size > max_total_bytes and result:
+            break
+        total_bytes += size
+        try:
+            rel = os.path.relpath(ap, base_dir)
+            display = rel if not rel.startswith("..") else os.path.basename(ap)
+        except ValueError:
+            display = os.path.basename(ap)
+        result.append((ap, display))
+    return result
+
+
+def _build_repo_tree(cwd: str | None = None, max_entries: int = 200) -> str:
+    """Build a compact file list of the workspace for Advisor context."""
+    base_dir = os.path.abspath(cwd or os.getcwd())
+    entries: list[str] = []
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            cwd=base_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            entries = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    except Exception:
+        entries = []
+
+    if not entries:
+        for root, dirs, files in os.walk(base_dir):
+            dirs[:] = sorted(d for d in dirs if d not in _ADVISOR_IGNORED_DIRS and not d.startswith("."))
+            for fn in sorted(files):
+                rel = os.path.relpath(os.path.join(root, fn), base_dir)
+                entries.append(rel)
+                if len(entries) >= max_entries:
+                    break
+            if len(entries) >= max_entries:
+                break
+
+    truncated = len(entries) > max_entries
+    shown = entries[:max_entries]
+    header = f"--- REPO FILE TREE ({base_dir}, {len(shown)}/{len(entries)} files) ---"
+    body = "\n".join(shown)
+    if truncated:
+        body += f"\n... ({len(entries) - max_entries} more files omitted)"
+    return f"{header}\n{body}\n--- END REPO FILE TREE ---"
 
 
 def ask_agentspace(
@@ -2095,6 +2457,54 @@ def ask_agentspace(
     python_pptx: bool = False,
     max_media_prompts: int = DEFAULT_MAX_MEDIA_PROMPTS,
     csesidx: str = DEFAULT_CSESIDX,
+    include_tree: bool = False,
+    advise_mode: bool = False,
+    cwd: str | None = None,
+) -> dict:
+    with contextlib.ExitStack() as stack:
+        return _ask_agentspace_inner(
+            prompt=prompt,
+            model_id=model_id,
+            thinking_level=thinking_level,
+            session=session,
+            enable_search=enable_search,
+            agent=agent,
+            delete_session_after=delete_session_after,
+            input_files=input_files,
+            save_output=save_output,
+            output_filename=output_filename,
+            session_tag=session_tag,
+            new_session=new_session,
+            python_pptx=python_pptx,
+            max_media_prompts=max_media_prompts,
+            csesidx=csesidx,
+            include_tree=include_tree,
+            advise_mode=advise_mode,
+            cwd=cwd,
+            _exit_stack=stack,
+        )
+
+
+def _ask_agentspace_inner(
+    prompt: str,
+    model_id: str = DEFAULT_MODEL,
+    thinking_level: str = DEFAULT_THINKING,
+    session: str | None = None,
+    enable_search: bool = False,
+    agent: str | None = None,
+    delete_session_after: bool = False,
+    input_files: list[str] | None = None,
+    save_output: bool = False,
+    output_filename: str | None = None,
+    session_tag: str | None = None,
+    new_session: bool = False,
+    python_pptx: bool = False,
+    max_media_prompts: int = DEFAULT_MAX_MEDIA_PROMPTS,
+    csesidx: str = DEFAULT_CSESIDX,
+    include_tree: bool = False,
+    advise_mode: bool = False,
+    cwd: str | None = None,
+    _exit_stack: contextlib.ExitStack | None = None,
 ) -> dict:
     if python_pptx and not agent:
         agent = "office-workflow-suite"
@@ -2122,6 +2532,7 @@ def ask_agentspace(
 
     effective_session = session
     reused_existing_session = False
+    isolated_from_busy_session = False
     rotated_previous_media_session: str | None = None
     if not effective_session and effective_state_tag and not new_session and not delete_session_after:
         cached_sess = get_reusable_session(effective_state_tag, mode_key)
@@ -2135,6 +2546,18 @@ def ask_agentspace(
                     pass
                 clear_reusable_session(effective_state_tag, mode_key, deleted_session_id=cached_sess)
                 cached_sess = None
+            if cached_sess and _exit_stack is not None:
+                short_cached = normalize_session_id(cached_sess)
+                inflight_path = os.path.join(OUTPUTS_DIR, f".inflight_sess_{short_cached}.lock")
+                try:
+                    _exit_stack.enter_context(_FileLock(inflight_path, blocking=False))
+                except BlockingIOError:
+                    print(
+                        f"[Agentspace Concurrency] Session {short_cached} is busy in a parallel subagent; spawning isolated session.",
+                        file=sys.stderr,
+                    )
+                    cached_sess = None
+                    isolated_from_busy_session = True
             if cached_sess:
                 effective_session = format_delete_session_name(cached_sess)
                 reused_existing_session = True
@@ -2158,18 +2581,24 @@ def ask_agentspace(
                 f"{mention_pill} {full_prompt}"
             )
 
+    if advise_mode:
+        full_prompt = f"{ADVISOR_SYSTEM_PREAMBLE}\n\n--- TASK ---\n{full_prompt}"
+
+    context_blocks: list[str] = []
+    if include_tree:
+        context_blocks.append(_build_repo_tree(cwd=cwd))
+
     attached_files: list[str] = []
     if input_files:
-        file_blocks = []
-        for fp in input_files:
-            abs_fp = os.path.abspath(fp)
-            if not os.path.isfile(abs_fp):
-                raise FileNotFoundError(f"Input file not found: {abs_fp}")
+        expanded = _expand_input_paths(input_files, cwd=cwd)
+        for abs_fp, display_path in expanded:
             with open(abs_fp, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
             attached_files.append(abs_fp)
-            file_blocks.append(f"--- BEGIN FILE: {os.path.basename(abs_fp)} ---\n{content}\n--- END FILE: {os.path.basename(abs_fp)} ---")
-        full_prompt = f"{full_prompt}\n\n" + "\n\n".join(file_blocks)
+            context_blocks.append(f"--- BEGIN FILE: {display_path} ---\n{content}\n--- END FILE: {display_path} ---")
+
+    if context_blocks:
+        full_prompt = f"{full_prompt}\n\n" + "\n\n".join(context_blocks)
 
     stream_req: dict = {
         "query": {"parts": [{"text": full_prompt}]},
@@ -2228,10 +2657,10 @@ def ask_agentspace(
         "streamAssistRequest": stream_req,
     }
 
-    timeout_sec = 480
+    timeout_sec = DEFAULT_STREAM_TIMEOUT
     chunks: list | dict = []
     xsrf_path = ""
-    for rpc_try in range(4):
+    for rpc_try in range(3):
         chunks, xsrf_path = _post_widget_rpc("widgetStreamAssist", payload, csesidx=csesidx, timeout=timeout_sec)
         stream_err = None
         if isinstance(chunks, list):
@@ -2239,16 +2668,16 @@ def ask_agentspace(
                 if isinstance(ch, dict) and "error" in ch:
                     stream_err = ch["error"]
                     break
-        if stream_err and rpc_try < 3:
+        if stream_err and rpc_try < 2:
             err_reason = ""
             for det in stream_err.get("details", []):
                 if isinstance(det, dict) and det.get("reason"):
                     err_reason = det["reason"]
                     break
-            wait_s = 6 * (rpc_try + 1)
+            wait_s = 5 * (rpc_try + 1)
             print(
                 f"[Agentspace Stream Error: {err_reason or stream_err.get('status') or stream_err.get('code')} "
-                f"(attempt {rpc_try + 1}/4). Retrying in {wait_s}s...]",
+                f"(attempt {rpc_try + 1}/3). Retrying in {wait_s}s...]",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2466,6 +2895,7 @@ def ask_agentspace(
                 session_name=session_name,
                 display_name=display_name,
                 is_media=is_media_turn,
+                update_active_slot=not isolated_from_busy_session,
             )
             if is_media_turn and max_media_prompts > 0 and media_prompt_count >= max_media_prompts:
                 try:
@@ -2483,10 +2913,11 @@ def ask_agentspace(
     final_text = "".join(text_parts).strip()
     saved_output_path = None
     if save_output or output_filename or python_pptx:
+        alloc_filename = output_filename or ("lxml_deck__python_pptx_lxml.pptx" if python_pptx else None)
         saved_output_path = build_scoped_output_path(
             prompt=prompt,
             session_tag=session_tag,
-            output_filename=output_filename,
+            output_filename=alloc_filename,
             agentspace_session_id=session_name,
         )
         if not python_pptx or (output_filename and not output_filename.lower().endswith(".pptx")):
@@ -2498,16 +2929,15 @@ def ask_agentspace(
         try:
             import pptx_lxml_wrapper
 
-            if output_filename and output_filename.lower().endswith(".pptx"):
+            if saved_output_path and saved_output_path.lower().endswith(".pptx"):
                 target_pptx = saved_output_path
             else:
-                base_path = saved_output_path or build_scoped_output_path(
+                target_pptx = build_scoped_output_path(
                     prompt=prompt,
                     session_tag=session_tag,
-                    output_filename="lxml_deck.pptx",
+                    output_filename="lxml_deck__python_pptx_lxml.pptx",
                     agentspace_session_id=session_name,
                 )
-                target_pptx = os.path.splitext(base_path)[0] + "__python_pptx_lxml.pptx"
 
             lxml_res = pptx_lxml_wrapper.compile_python_pptx_from_response(
                 response_text=final_text,
@@ -2610,7 +3040,17 @@ def main():
         action="append",
         default=[],
         metavar="FILE_PATH",
-        help="Attach a local file directly from disk into the prompt (can be specified multiple times) to save AGY tokens",
+        help="Attach a local file, directory, or glob pattern directly from disk into the prompt (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--advise",
+        action="store_true",
+        help="Advisor Planner Mode: use gemini-4-carbon + HIGH thinking, attach repo tree, inject Implementation Manifest framing, and save to advisor_plan.md (--summary-only)",
+    )
+    parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="Attach a compact repository file tree to the prompt",
     )
     parser.add_argument(
         "--save-output",
@@ -2980,26 +3420,33 @@ def main():
         if args.pptx_mode and args.pptx_mode.lower() == "default" and not args.agent:
             args.agent = "office-workflow-suite"
 
+        effective_model = "gemini-4-carbon" if (args.advise and args.model == DEFAULT_MODEL) else args.model
+        effective_thinking = "HIGH" if (args.advise and args.thinking == DEFAULT_THINKING) else args.thinking
+        effective_output = args.output_filename or ("advisor_plan.md" if args.advise else None)
+        effective_summary = bool(args.summary_only or args.advise or use_native_pptx)
+
         res = ask_agentspace(
             prompt=args.prompt,
-            model_id=args.model,
-            thinking_level=args.thinking,
+            model_id=effective_model,
+            thinking_level=effective_thinking,
             session=args.session,
             enable_search=args.search,
             agent=args.agent,
             delete_session_after=args.delete_after,
             input_files=args.input_files,
-            save_output=args.save_output or bool(args.output_filename) or args.summary_only or use_native_pptx,
-            output_filename=args.output_filename,
+            save_output=args.save_output or bool(effective_output) or effective_summary,
+            output_filename=effective_output,
             session_tag=args.session_tag,
             new_session=args.new_session,
             python_pptx=use_native_pptx,
             max_media_prompts=args.max_media_prompts,
             csesidx=args.csesidx,
+            include_tree=bool(args.tree or args.advise),
+            advise_mode=bool(args.advise),
         )
         if args.json:
             print(json.dumps(res, indent=2))
-        elif (args.summary_only or use_native_pptx) and res.get("saved_output_path"):
+        elif effective_summary and res.get("saved_output_path"):
             preview = res["text"][: args.max_preview_chars]
             if len(res["text"]) > args.max_preview_chars:
                 preview += "\n... [truncated in stdout to save AGY tokens]"

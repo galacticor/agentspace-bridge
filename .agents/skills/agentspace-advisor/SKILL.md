@@ -20,27 +20,34 @@ description: >-
 
 ---
 
-## Core Workflow (Zero Output-Token Context Sharing)
+## Core Workflow (Advisor as Planner, Small Model as Executor)
 
-1. **Attach Local Files Directly (`-f <file_path>`):**
-   - Never paste large file contents into the prompt. Pass one or more `-f <path>` flags to `agentspace_cli.py` so the files are uploaded directly from disk.
-2. **Select Advisor Model & High Thinking:**
-   - Pass `--model gemini-4-argon` (or `--model gemini-4-carbon`) and `--thinking HIGH`.
-3. **Maintain Session Continuity (`--session-tag`):**
-   - Always pass `--session-tag <8_char_conv_id>` so follow-up turns reuse the same `[agy-bridge]` session without re-uploading earlier files.
-4. **Interactive Agentic Context Loop (Let the Advisor Ask for What It Needs):**
-   - Instruct the Advisor in your prompt: *"If you need additional files, schemas, or command outputs before finalizing the plan, list them under `[NEED_CONTEXT]` instead of guessing."*
-   - If the Advisor responds with `[NEED_CONTEXT]`, gather those exact files/outputs locally and send them in the next turn using `-f <requested_file>` with the **same `--session-tag`** (cap at 2–3 rounds).
-5. **Save the Implementation Plan to Disk (`-o advisor_plan.md --summary-only`):**
-   - Save the advisor's full plan to `./outputs/chat_<tag>/` and return only a compact preview to Antigravity's context.
-   - Read the saved `advisor_plan.md` locally and execute the steps in Antigravity.
+1. **Attach Local Files, Directories, or Globs (`files` / `-f`):**
+   - Never paste large file contents into the prompt. Pass files, directories (e.g. `src/`), or globs (e.g. `src/**/*.py`) directly so they are read from disk.
+2. **Use `agentspace_advise` (MCP) or `--advise` (CLI):**
+   - Automatically selects `gemini-4-carbon` + `HIGH` thinking, attaches a compact repo file tree (`include_tree=True` / `--tree`), injects the **Planner Implementation Manifest** framing, and saves to `advisor_plan.md` with `--summary-only`.
+3. **Maintain Session Continuity (`session_tag`):**
+   - Always pass `session_tag` (`<8_char_conv_id>`) so follow-up turns reuse the same `[agy-bridge]` session without re-uploading earlier files.
+4. **Interactive `[NEED_CONTEXT]` Loop:**
+   - If the Advisor responds with `[NEED_CONTEXT]`, gather those exact files/command outputs locally and send them in the next turn with the **same `session_tag`** (cap at 2–3 rounds).
+5. **Execute Locally:**
+   - Read the saved `advisor_plan.md` locally and apply the edits + run the verification commands in Antigravity.
 
-### Example Command
+### Option A: Zero-Friction MCP (`agentspace_advise`)
 
-*(If `agentspace_ask` MCP tool is available, you can call it directly; otherwise run `agentspace_cli.py` using its repo path so it works from any workspace:)*
+```python
+agentspace_advise(
+    task="Refactor auth middleware to support token rotation and add unit tests.",
+    files=["src/auth/", "tests/test_auth.py"],
+    cwd="/path/to/repo",
+    session_tag="<8_char_conv_id>",
+)
+```
+
+### Option B: CLI (`--advise`)
 
 ```bash
-python3 "$HOME/Documents/Projects/agentspace-bridge/agentspace_cli.py" "Review the attached files and produce a step-by-step implementation plan with exact file paths, function signatures, edge cases, and verification steps." --model gemini-4-argon --thinking HIGH -f path/to/file1.py -f path/to/file2.py -o advisor_plan.md --session-tag <8_char_conv_id> --summary-only
+python3 "$HOME/Documents/Projects/agentspace-bridge/agentspace_cli.py" "Refactor auth middleware to support token rotation." --advise -f src/auth/ -f tests/test_auth.py --session-tag <8_char_conv_id>
 ```
 
 *(Note: If `agentspace_cli.py` backgrounds after `WaitMsBeforeAsync`, do **not** poll `manage_task` or set `schedule` timers—end your turn and wait for Antigravity's reactive wakeup.)*

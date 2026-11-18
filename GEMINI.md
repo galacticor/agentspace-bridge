@@ -15,8 +15,13 @@ Use **IOH Agentspace** strictly for tasks that require **IOH enterprise data, IO
    - **Mode 3A (Default — Hybrid Pipeline):** Query Agentspace (`--agent netra` or `--search`) to extract IOH data into an exhaustive slide-by-slide Markdown outline (`-o slide_outline.md --summary-only`), then build the `.pptx` **locally via a delegated Antigravity subagent** (`executive-slides` + `minimal-slides` + `pptx` / `pptxgenjs` + M365 Visual QA via `office_view_hook.py`). *(Note: If the presentation uses purely local files already on disk and needs zero IOH data, skip Agentspace completely and build locally!)*
    - **Mode 3B (When User Explicitly Requests Agentspace to Create Slides):** Invoke the user's configured **`office-workflow-suite` Skill Agent (`14950672669329422296`)** via `--agent office-workflow-suite` (or `--agent slides`), which loads `office-workflow-suite` (`references/executive-slides.md` and `references/minimal-slides.md`) inside Agentspace and auto-exports the native `.pptx` via `widgetExportImmersiveArtifact`.
 4. **Agentspace Advisor Mode (`--model gemini-4-argon` / `gemini-4-carbon`, `--thinking HIGH`, `-f <file>`)**:
-   - When Antigravity is constrained to a lighter local model (e.g., Hydrogen) and faces complex architecture, multi-file refactoring, or hard root-cause debugging, use Agentspace as an **external Senior Architect / Advisor** (`agentspace_cli.py --model gemini-4-argon --thinking HIGH -f <file1> -f <file2> -o advisor_plan.md --summary-only --session-tag <8_char_conv_id>`).
-   - **Zero Output-Token Context Sharing:** Always pass local files via `-f <path>` (never paste large codeblocks into the prompt) and save the resulting implementation plan to disk via `-o advisor_plan.md --summary-only`, then execute the plan locally in Antigravity. Keep trivial local edits, simple lint fixes, and routine unit-test loops 100% local.
+   - When Antigravity is constrained to a lighter local model (e.g., Hydrogen) and faces complex architecture, multi-file refactoring, or hard root-cause debugging, use Agentspace as an **external Senior Architect / Advisor** (`agentspace_cli.py --advise -f <file1> -f <file2> --session-tag <8_char_conv_id>`).
+   - **Strict `<antigravity_spec>` Bridge:** `--advise` / `agentspace_advise` instructs Agentspace to end every advisory turn with a compact `<antigravity_spec>` block (exact file paths + line/function targets, exact code changes, edge cases, and verification commands). The tool and CLI return this `<antigravity_spec>` inline and auto-write `*.spec.md` to disk, allowing the Executor to execute changes directly without an extra `read_file` roundtrip on `advisor_plan.md`.
+   - **Zero Output-Token Context Sharing & Auto-Deduplication:** Always pass local files via `-f <path>` (never paste large codeblocks into the prompt). Multi-turn follow-ups in the same session tag automatically hash and deduplicate unchanged files, so you do not need to re-pass unchanged context. Keep trivial local edits, simple lint fixes, and routine unit-test loops 100% local.
+5. **Context Hygiene & Local Model Routing:**
+   - **Trim Terminal Noise:** Pipe verbose CLI outputs (`pytest`, SQL dry-runs, dataframe prints, stack traces) with `--tb=short`, `-q`, or `| head -n 30`.
+   - **Compact / Reset:** Start a fresh session or `/compact` every ~40k tokens after completing a milestone.
+   - **Model Routing:** Use **Hydrogen** (or **Flash Medium/High** via `/argon-flash`) for local execution; only use `flash-lite` if explicitly specified.
 
 ---
 
@@ -24,7 +29,7 @@ Use **IOH Agentspace** strictly for tasks that require **IOH enterprise data, IO
 
 - **Target Endpoints (`https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/`):**
   - `widgetStreamAssist`: Send chat queries to specialized IOH Agents (`agentsSpec.agentSpecs`), Skill Agents (`load_skill` + `canvasSpec`), or Federated Search (`vertexAiSearchSpec`).
-  - `widgetDeleteSession`: Delete a chat session (`deleteSessionRequest: {"name": "<short_session_id>"}`).
+  - `widgetDeleteSession`: Delete a chat session (`deleteSessionRequest: {"name": "collections/default_collection/engines/enterprise-search-17429648_1742964839282/sessions/<short_session_id>"}`). Requires full engine prefix.
   - `widgetListSessions`: List recent chat sessions (`listSessionsRequest: {}`).
   - `widgetGetSession`: Retrieve full session turn & tool-call history (`getSessionRequest: {"name": "<short_session_id>", "includeAnswerDetails": true}`).
   - `widgetGetImmersiveArtifact`: Retrieve Canvas / Slides `immersiveArtifact` payload (`getImmersiveArtifactRequest: {"name": "<artifact_id>"}`).
@@ -32,10 +37,11 @@ Use **IOH Agentspace** strictly for tasks that require **IOH enterprise data, IO
   - `lookupWidgetConfig`: Retrieve widget configuration, connectors, and enabled models.
 - **Widget Config ID (`cid`):** `384c42b0-2885-415a-82d5-f2babc063b6e`
 - **Underlying GCP Engine:** `projects/195467123768/locations/global/collections/default_collection/engines/enterprise-search-17429648_1742964839282`
-- **Model ID:** `gemini-4-argon` (supports `thinkingLevel`: `"LOW"`, `"MEDIUM"`, `"HIGH"`)
+- **Model IDs:** `gemini-4-argon` (default) and `gemini-4-carbon` (supports `thinkingLevel`: `"LOW"`, `"MEDIUM"`, `"HIGH"`)
 - **Known Agent & Skill Aliases (`--agent`):**
   - `netra` -> `17783079275007264980` (Netra Multi-Agent Coordinator: CVM, Network Analytics, Techno, Export, User Analytics)
   - `ace` -> `8461818071814491910` (ACE Platform Agent)
+  - `workflow` / `netra-office-workflow` -> `8458183310708652909` (`Netra & Office Workflow Coordinator`)
   - `office-workflow-suite` / `office` / `slides` / `pptx` -> `14950672669329422296` (Configured `office-workflow-suite` `SKILL_AGENT` in Agentspace; automatically invokes `load_skill` for `office-workflow-suite` + `references/executive-slides.md` & `references/minimal-slides.md`, generates Canvas slides, and exports `.pptx`)
   - `office-creator` -> `17216682253898748109` (`Office File Creator` LOW_CODE Multi-Agent upgraded to V2 architecture)
   - `office-creator-2` / `office2` / `office-v2` -> `2291045905737541211` (`Office File Creator 2.0` LOW_CODE Multi-Agent)

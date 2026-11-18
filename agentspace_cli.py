@@ -260,6 +260,7 @@ AGENT_ALIASES: dict[str, str] = {
     "office-creator": "17216682253898748109",
     "office-creator-2": "2291045905737541211",
     "office2": "2291045905737541211",
+    "office-v2": "2291045905737541211",
     "agb": "18420663427156982501",
     "catalyst": "app_catalyst_agent",
     "netra-office-workflow": "8458183310708652909",
@@ -295,11 +296,9 @@ EXPORT_MIME_TYPES: dict[str, str] = {
 
 
 def normalize_session_id(session_id: str) -> str:
-    """Extracts the short numeric session ID for widgetGetSession / display."""
-    cleaned = session_id.strip().rstrip("/")
-    if "/" in cleaned:
-        return cleaned.split("/")[-1]
-    return cleaned
+    """Extracts the short numeric/resource ID and strips path traversal chars."""
+    cleaned = re.split(r"[/\\]+", session_id.strip().rstrip("/\\"))[-1]
+    return re.sub(r"[^A-Za-z0-9_.-]", "", cleaned).strip(".")
 
 
 def format_delete_session_name(session_id: str) -> str:
@@ -626,7 +625,7 @@ def refresh_xsrf_token(
                 f"Timed out after {timeout_sec}s waiting for Agentspace SSO login and XSRF token."
             )
 
-        captured["savedAt"] = max(int(captured.get("savedAt") or time.time()), int(min_saved_at or 0), call_started_at + 1)
+        captured["savedAt"] = max(int(captured.get("savedAt") or 0), int(time.time()), int(min_saved_at or 0), call_started_at + 1)
         _atomic_write_json(target_save_path, captured)
         print(
             f"[Agentspace Auth] Saved fresh token (keyId={captured.get('keyId')}, csesidx={captured.get('csesidx')}) to {target_save_path}",
@@ -744,6 +743,9 @@ def _build_browser_rpc_headers(jwt_tok: str) -> dict[str, str]:
     }
 
 
+_TRANSIENT_HTTP_CODES = {429, 502, 503, 504}
+
+
 def _post_widget_rpc(
     endpoint: str,
     payload: dict,
@@ -758,8 +760,20 @@ def _post_widget_rpc(
             raise
         xsrf, xsrf_path = refresh_xsrf_token(csesidx=csesidx, min_saved_at=int(time.time()) - 5)
 
-    for attempt in range(2):
-        effective_csesidx = str(xsrf.get("csesidx") or csesidx)
+    refreshed_auth = False
+    transient_tries = 0
+    for _ in range(4):
+        effective_csesidx = str(xsrf.get("csesidx") or csesidx or DEFAULT_CSESIDX).strip()
+        if not effective_csesidx:
+            if auto_refresh and not refreshed_auth:
+                refreshed_auth = True
+                xsrf, xsrf_path = refresh_xsrf_token(csesidx=None, min_saved_at=int(time.time()) - 5)
+                effective_csesidx = str(xsrf.get("csesidx") or DEFAULT_CSESIDX).strip()
+            if not effective_csesidx:
+                raise ValueError(
+                    "Missing Agentspace csesidx. Set AGENTSPACE_CSESIDX in .env/agentspace_local.json or run --refresh-token."
+                )
+
         jwt_tok = make_jwt(xsrf, csesidx=effective_csesidx)
         url = f"https://{HOST}/v1alpha/locations/global/{endpoint}"
         req = urllib.request.Request(
@@ -779,7 +793,6 @@ def _post_widget_rpc(
                 try:
                     return json.loads(raw), xsrf_path
                 except json.JSONDecodeError:
-                    # Salvage complete JSON objects from partial stream array
                     salvaged = []
                     decoder = json.JSONDecoder()
                     idx = 0
@@ -799,7 +812,8 @@ def _post_widget_rpc(
                         return salvaged, xsrf_path
                     raise
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403) and auto_refresh and attempt == 0:
+            if e.code in (401, 403) and auto_refresh and not refreshed_auth:
+                refreshed_auth = True
                 stale_kid = str(xsrf.get("keyId") or "")
                 next_min_ts = int(xsrf.get("savedAt") or 0) + 1
                 print(
@@ -811,6 +825,16 @@ def _post_widget_rpc(
                     stale_key_id=stale_kid or None,
                     min_saved_at=next_min_ts if next_min_ts > 1 else int(time.time()),
                 )
+                continue
+            if e.code in _TRANSIENT_HTTP_CODES and transient_tries < 2:
+                transient_tries += 1
+                time.sleep(1.5 * transient_tries)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.RemoteDisconnected):
+            if transient_tries < 2:
+                transient_tries += 1
+                time.sleep(1.5 * transient_tries)
                 continue
             raise
     raise RuntimeError("Unreachable RPC retry state")
@@ -948,6 +972,7 @@ def _load_session_state(session_tag: str | None) -> tuple[dict, str | None]:
         "sessions": {},
         "prompt_counts": {},
         "media_sessions": [],
+        "context_hashes": {},
         "history": [],
     }
     if state_path and os.path.isfile(state_path):
@@ -964,6 +989,8 @@ def _load_session_state(session_tag: str | None) -> tuple[dict, str | None]:
         state["prompt_counts"] = {}
     if not isinstance(state.get("media_sessions"), list):
         state["media_sessions"] = []
+    if not isinstance(state.get("context_hashes"), dict):
+        state["context_hashes"] = {}
     if not isinstance(state.get("history"), list):
         state["history"] = []
     return state, state_path
@@ -999,6 +1026,8 @@ def clear_reusable_session(
             state["media_sessions"] = [
                 s for s in state.get("media_sessions", []) if normalize_session_id(s) != short_del
             ]
+            if isinstance(state.get("context_hashes"), dict):
+                state["context_hashes"].pop(short_del, None)
         state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _atomic_write_json(state_path, state)
 
@@ -1041,6 +1070,32 @@ def save_reusable_session(
             state["last_display_name"] = display_name
         _atomic_write_json(state_path, state)
         return new_count
+
+
+def get_session_context_hashes(session_tag: str | None, session_id: str | None) -> dict[str, str]:
+    if not session_tag or not session_id:
+        return {}
+    state, _ = _load_session_state(session_tag)
+    short_id = normalize_session_id(session_id)
+    bucket = state.get("context_hashes", {}).get(short_id, {})
+    return dict(bucket) if isinstance(bucket, dict) else {}
+
+
+def update_session_context_hashes(
+    session_tag: str | None,
+    session_id: str | None,
+    new_hashes: dict[str, str],
+) -> None:
+    state_path = _get_session_state_path(session_tag)
+    if not state_path or not session_id or not new_hashes:
+        return
+    short_id = normalize_session_id(session_id)
+    with _FileLock(f"{state_path}.lock", blocking=True, timeout_sec=15):
+        state, _ = _load_session_state(session_tag)
+        bucket = state.setdefault("context_hashes", {}).setdefault(short_id, {})
+        if isinstance(bucket, dict):
+            bucket.update(new_hashes)
+        _atomic_write_json(state_path, state)
 
 
 def finish_task_sessions(
@@ -1099,6 +1154,10 @@ def finish_task_sessions(
                         if isinstance(st.get("prompt_counts"), dict):
                             st["prompt_counts"].pop(m_key, None)
 
+                if isinstance(st.get("context_hashes"), dict):
+                    for sid in sessions_to_delete:
+                        st["context_hashes"].pop(sid, None)
+
                 st["media_sessions"] = []
                 st["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 try:
@@ -1110,10 +1169,10 @@ def finish_task_sessions(
         # Also check filenames in sub-asset folders (`chat_<tag>_img1__<ts>__<short_id>__...`)
         if is_sub_asset_dir:
             for fname in os.listdir(d_path):
-                m_fn = re.match(r"^chat_[a-z0-9_]+__\d{8}_\d{6}__([0-9]{6,22})__", fname)
+                m_fn = re.match(r"^chat_[a-z0-9_]+__(?:\d{8}_\d{6}__)?([0-9]{12,22})__", fname)
                 if m_fn:
                     cand_prefix = m_fn.group(1)
-                    if len(cand_prefix) >= 12 and cand_prefix not in sessions_to_delete:
+                    if cand_prefix not in sessions_to_delete:
                         sessions_to_delete.append(cand_prefix)
 
     deleted_ids: list[str] = []
@@ -1616,9 +1675,8 @@ def download_session_media_files(
         return hdrs
 
     xsrf, _ = load_xsrf()
-    dl_headers = _make_dl_headers(xsrf)
 
-    out_prefix = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+    out_prefix = _format_tag_prefix(session_tag, 16)
     slug_part = f"__{_sanitize_slug(prompt_slug, 28)}" if prompt_slug else ""
 
     downloaded: list[dict] = []
@@ -1652,6 +1710,7 @@ def download_session_media_files(
         out_path = os.path.join(target_dir, out_filename)
 
         file_bytes = b""
+        dl_headers = _make_dl_headers(xsrf)
         for dl_try in range(2):
             req = urllib.request.Request(raw_uri, headers=dl_headers, method="GET")
             try:
@@ -1699,6 +1758,7 @@ def export_session_artifacts(
     (the exact backend RPCs behind the Web UI's `Export -> Download as pptx / Download as PDF` menu).
     Costs ZERO Antigravity LLM tokens!
     """
+    session_tag = session_tag or os.environ.get("AGY_SESSION_TAG") or None
     short_sess = normalize_session_id(session_id) if session_id else None
     if not short_sess and not artifact_id and session_tag:
         # Try finding the latest slides or active session from session_state.json
@@ -1777,7 +1837,7 @@ def export_session_artifacts(
             if not tag_nat.startswith("chat_"):
                 tag_nat = f"chat_{tag_nat}"
             target_dir_nat = os.path.join(OUTPUTS_DIR, tag_nat)
-        out_prefix_nat = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+        out_prefix_nat = _format_tag_prefix(session_tag, 16)
         out_path_nat = os.path.join(target_dir_nat, f"{out_prefix_nat}{short_sess}__native_pptx.pptx")
 
         if b64_office_payloads:
@@ -1925,7 +1985,7 @@ def export_session_artifacts(
 
         if fmt_key == "pptx":
             slides_html_list = art_obj.get("slidesArtifact", {}).get("slides", [])
-            out_prefix = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+            out_prefix = _format_tag_prefix(session_tag, 16)
             out_filename = f"{out_prefix}{short_sess or target_artifact_id[:8]}__{slug_title}.{fmt_key}"
             out_path = os.path.join(target_dir, out_filename)
             if slides_html_list:
@@ -1976,7 +2036,7 @@ def export_session_artifacts(
             raise RuntimeError(f"Empty fileContent returned by widgetExportImmersiveArtifact for format={fmt_key}")
 
         file_bytes = base64.b64decode(b64_content)
-        out_prefix = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+        out_prefix = _format_tag_prefix(session_tag, 16)
         out_filename = f"{out_prefix}{short_sess or target_artifact_id[:8]}__{slug_title}.{fmt_key}"
         out_path = os.path.join(target_dir, out_filename)
         with open(out_path, "wb") as f:
@@ -1991,7 +2051,7 @@ def export_session_artifacts(
     if need_webui_pdf:
         if not short_sess:
             raise ValueError("A session_id (or active --session-tag) is required to export PDF via the Web UI Canvas.")
-        out_prefix = f"chat_{_sanitize_slug(session_tag, 16)}__" if session_tag else ""
+        out_prefix = _format_tag_prefix(session_tag, 16)
         pdf_filename = f"{out_prefix}{short_sess}__{slug_title}.pdf"
         pdf_path = os.path.join(target_dir, pdf_filename)
         _export_pdf_via_webui(short_sess=short_sess, save_pdf_path=pdf_path, csesidx=csesidx)
@@ -2049,7 +2109,7 @@ def watch_and_autocompile(
                 sess_id = s.get("session_id", "")
                 if not sess_id:
                     continue
-                sig = f"{s.get('start_time', '')}|{s.get('display_name', '')}"
+                sig = f"{s.get('last_message_time') or s.get('start_time', '')}|{s.get('turns_count', 0)}|{s.get('display_name', '')}"
                 if compiled_state.get(sess_id) == sig:
                     continue
                 try:
@@ -2060,8 +2120,7 @@ def watch_and_autocompile(
                         csesidx=csesidx,
                     )
                     compiled_state[sess_id] = sig
-                    with open(state_file, "w", encoding="utf-8") as f:
-                        json.dump(compiled_state, f, indent=2)
+                    _atomic_write_json(state_file, compiled_state)
                     compiled_results.append(exp_res)
                     print(
                         f"  [AUTO-COMPILED] Session {sess_id} ('{exp_res['title']}', {exp_res['slides_count']} slides):",
@@ -2072,8 +2131,7 @@ def watch_and_autocompile(
                 except ValueError:
                     # Normal chat session without slides or native pptx code; mark seen so we don't re-fetch
                     compiled_state[sess_id] = sig
-                    with open(state_file, "w", encoding="utf-8") as f:
-                        json.dump(compiled_state, f, indent=2)
+                    _atomic_write_json(state_file, compiled_state)
                 except Exception as sess_err:
                     print(f"  [WARN] Session {sess_id} compile warning: {sess_err}", file=sys.stderr, flush=True)
         except KeyboardInterrupt:
@@ -2110,8 +2168,28 @@ def serve_chrome_bridge(
     import urllib.parse
 
     class BridgeHandler(http.server.BaseHTTPRequestHandler):
+        _ALLOWED_ORIGINS = {ORIGIN.rstrip("/"), AGENTSPACE_ENTRY_URL.rstrip("/")}
+
+        def _is_trusted_request(self) -> bool:
+            if (self.headers.get("Sec-Fetch-Mode") or "").lower() == "no-cors":
+                return False
+            req_origin = (self.headers.get("Origin") or "").rstrip("/")
+            if req_origin and req_origin not in self._ALLOWED_ORIGINS and not req_origin.startswith("chrome-extension://"):
+                return False
+            ref = self.headers.get("Referer") or ""
+            if ref:
+                p = urllib.parse.urlparse(ref)
+                ref_origin = f"{p.scheme}://{p.netloc}".rstrip("/")
+                if ref_origin not in self._ALLOWED_ORIGINS and not ref_origin.startswith("chrome-extension://"):
+                    return False
+            return True
+
         def _send_cors_headers(self) -> None:
-            self.send_header("Access-Control-Allow-Origin", "*")
+            req_origin = (self.headers.get("Origin") or "").rstrip("/")
+            allowed = {ORIGIN.rstrip("/"), AGENTSPACE_ENTRY_URL.rstrip("/")}
+            if req_origin in allowed or req_origin.startswith("chrome-extension://"):
+                self.send_header("Access-Control-Allow-Origin", req_origin)
+                self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PPTX-Compiler, X-PPTX-Slides")
@@ -2122,6 +2200,11 @@ def serve_chrome_bridge(
             self.end_headers()
 
         def do_GET(self) -> None:
+            if not self._is_trusted_request():
+                self.send_response(403)
+                self.end_headers()
+                return
+
             parsed = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed.query)
 
@@ -2139,6 +2222,15 @@ def serve_chrome_bridge(
                 raw_sess = (qs.get("session", [""])[0] or "").strip()
                 req_csesidx = (qs.get("csesidx", [csesidx])[0] or csesidx).strip()
                 req_tag = (qs.get("tag", [session_tag or "chrome_ext"])[0] or "chrome_ext").strip()
+                if (raw_sess and not re.fullmatch(r"[A-Za-z0-9_/-]+", raw_sess)) or not re.fullmatch(r"[A-Za-z0-9_-]*", req_csesidx):
+                    body = json.dumps({"ok": False, "error": "Invalid session or csesidx"}).encode("utf-8")
+                    self.send_response(400)
+                    self._send_cors_headers()
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 short_sess = normalize_session_id(raw_sess) if raw_sess else None
 
                 try:
@@ -2279,6 +2371,15 @@ def _sanitize_slug(text: str, max_len: int = 36) -> str:
     return cleaned[:max_len] or "output"
 
 
+def _format_tag_prefix(session_tag: str | None, max_len: int = 24) -> str:
+    if not session_tag:
+        return ""
+    slug = _sanitize_slug(session_tag, max_len=max_len)
+    if not slug.startswith("chat_"):
+        slug = f"chat_{slug}"
+    return f"{slug}__"
+
+
 def build_scoped_output_path(
     prompt: str,
     session_tag: str | None = None,
@@ -2344,26 +2445,86 @@ ADVISOR_SYSTEM_PREAMBLE = (
     "do NOT guess — list the exact paths or commands under a `[NEED_CONTEXT]` section and stop."
 )
 
+ADVISOR_FOLLOWUP_PREAMBLE = (
+    "Continue acting as the **Senior Architect & Planner** for this session. "
+    "End this turn with an updated, self-contained `<antigravity_spec>` block "
+    "(or `[NEED_CONTEXT]` if still blocked)."
+)
 
-def _expand_input_paths(
+_ANTIGRAVITY_SPEC_RE = re.compile(
+    r"(?ms)^[ \t]*<antigravity_"
+    r"spec\b[^>]*>.*?^[ \t]*</antigravity_"
+    r"spec>[ \t]*$",
+    re.IGNORECASE,
+)
+_ANTIGRAVITY_SPEC_INLINE_RE = re.compile(
+    r"(<antigravity_"
+    r"spec\b[^>]*>.*?</antigravity_"
+    r"spec>)",
+    re.DOTALL | re.IGNORECASE,
+)
+_NEED_CONTEXT_RE = re.compile(
+    r"(?ms)^[ \t]*(?:#{1,6}[ \t]+|\*\*)?\[NEED[_]CONTEXT\](?:\*\*)?[ \t]*:?.*",
+)
+
+
+def _is_sensitive_filename(filename: str) -> bool:
+    low = filename.lower()
+    if low.endswith((".example", ".sample", ".template", ".example.json")):
+        return False
+    return (
+        low in {".env", "agentspace_local.json", "json.txt", "id_rsa", "id_ed25519"}
+        or low.startswith((".env.", "agentspace_xsrf", "getoxsrf"))
+        or low.endswith((".pem", ".key", ".p12", ".pfx"))
+    )
+
+
+def extract_advisor_blocks(text: str) -> dict[str, str | None]:
+    if not text:
+        return {"spec_block": None, "need_context_block": None}
+    blocks = _ANTIGRAVITY_SPEC_RE.findall(text) or _ANTIGRAVITY_SPEC_INLINE_RE.findall(text)
+    spec_block = blocks[-1].strip() if blocks else None
+    need_m = None if spec_block else _NEED_CONTEXT_RE.search(text)
+    need_block = need_m.group(0).strip() if need_m else None
+    return {"spec_block": spec_block, "need_context_block": need_block}
+
+
+def _expand_input_paths_with_report(
     paths: list[str],
     cwd: str | None = None,
     max_files: int = 40,
     max_total_bytes: int = 300_000,
-) -> list[tuple[str, str]]:
-    """Expand file paths, directories, and glob patterns into (abs_path, display_rel_path) tuples."""
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """
+    Expand file paths, directories, and glob patterns into (abs_path, display_rel_path) tuples
+    and return a list of paths skipped due to file count or total byte limits.
+    """
     import glob as _glob
 
     base_dir = os.path.abspath(cwd or os.getcwd())
     collected: list[str] = []
     seen: set[str] = set()
+    skipped: list[str] = []
+
+    def _get_display(path_str: str) -> str:
+        try:
+            rel = os.path.relpath(path_str, base_dir)
+            return rel if not rel.startswith("..") else os.path.basename(path_str)
+        except ValueError:
+            return os.path.basename(path_str)
 
     def _add_file(p: str) -> None:
         ap = os.path.abspath(p)
         if ap in seen or not os.path.isfile(ap):
             return
+        fn = os.path.basename(ap)
+        display = _get_display(ap)
+        if _is_sensitive_filename(fn):
+            skipped.append(f"{display} (sensitive file omitted)")
+            return
         ext = os.path.splitext(ap)[1].lower()
         if ext in _ADVISOR_BINARY_EXTS:
+            skipped.append(f"{display} (binary file omitted)")
             return
         seen.add(ap)
         collected.append(ap)
@@ -2373,16 +2534,15 @@ def _expand_input_paths(
         if any(ch in raw for ch in ("*", "?", "[")):
             for m in sorted(_glob.glob(candidate, recursive=True)):
                 if os.path.isfile(m):
+                    rel_parts = os.path.relpath(os.path.abspath(m), base_dir).split(os.sep)
+                    if any(pt in _ADVISOR_IGNORED_DIRS for pt in rel_parts[:-1]):
+                        continue
                     _add_file(m)
         elif os.path.isdir(candidate):
             for root, dirs, files in os.walk(candidate):
                 dirs[:] = sorted(d for d in dirs if d not in _ADVISOR_IGNORED_DIRS and not d.startswith("."))
                 for fn in sorted(files):
-                    if len(collected) >= max_files:
-                        break
                     _add_file(os.path.join(root, fn))
-                if len(collected) >= max_files:
-                    break
         elif os.path.isfile(candidate):
             _add_file(candidate)
         else:
@@ -2390,18 +2550,32 @@ def _expand_input_paths(
 
     result: list[tuple[str, str]] = []
     total_bytes = 0
-    for ap in collected[:max_files]:
+    for ap in collected:
         size = os.path.getsize(ap)
+        display = _get_display(ap)
+
+        if len(result) >= max_files:
+            skipped.append(f"{display} (exceeded {max_files} max files limit)")
+            continue
         if total_bytes + size > max_total_bytes and result:
-            break
+            skipped.append(f"{display} (exceeded {max_total_bytes}B budget)")
+            continue
+
         total_bytes += size
-        try:
-            rel = os.path.relpath(ap, base_dir)
-            display = rel if not rel.startswith("..") else os.path.basename(ap)
-        except ValueError:
-            display = os.path.basename(ap)
         result.append((ap, display))
-    return result
+
+    return result, skipped
+
+
+def _expand_input_paths(
+    paths: list[str],
+    cwd: str | None = None,
+    max_files: int = 40,
+    max_total_bytes: int = 300_000,
+) -> list[tuple[str, str]]:
+    """Expand file paths, directories, and glob patterns into (abs_path, display_rel_path) tuples."""
+    files, _ = _expand_input_paths_with_report(paths, cwd=cwd, max_files=max_files, max_total_bytes=max_total_bytes)
+    return files
 
 
 def _build_repo_tree(cwd: str | None = None, max_entries: int = 200) -> str:
@@ -2410,14 +2584,15 @@ def _build_repo_tree(cwd: str | None = None, max_entries: int = 200) -> str:
     entries: list[str] = []
     try:
         proc = subprocess.run(
-            ["git", "ls-files"],
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
             cwd=base_dir,
             capture_output=True,
             text=True,
             timeout=5,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            entries = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+            raw_entries = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+            entries = [e for e in raw_entries if not _is_sensitive_filename(os.path.basename(e))]
     except Exception:
         entries = []
 
@@ -2425,11 +2600,13 @@ def _build_repo_tree(cwd: str | None = None, max_entries: int = 200) -> str:
         for root, dirs, files in os.walk(base_dir):
             dirs[:] = sorted(d for d in dirs if d not in _ADVISOR_IGNORED_DIRS and not d.startswith("."))
             for fn in sorted(files):
+                if _is_sensitive_filename(fn):
+                    continue
                 rel = os.path.relpath(os.path.join(root, fn), base_dir)
                 entries.append(rel)
-                if len(entries) >= max_entries:
+                if len(entries) >= max_entries + 1:
                     break
-            if len(entries) >= max_entries:
+            if len(entries) >= max_entries + 1:
                 break
 
     truncated = len(entries) > max_entries
@@ -2506,6 +2683,7 @@ def _ask_agentspace_inner(
     cwd: str | None = None,
     _exit_stack: contextlib.ExitStack | None = None,
 ) -> dict:
+    session_tag = session_tag or os.environ.get("AGY_SESSION_TAG") or None
     if python_pptx and not agent:
         agent = "office-workflow-suite"
     resolved_agent = resolve_agent_id(agent)
@@ -2524,7 +2702,11 @@ def _ask_agentspace_inner(
                 else (
                     f"model:{model_id}:media"
                     if is_media_prompt
-                    else f"model:{model_id}:search={int(bool(enable_search))}"
+                    else (
+                        f"model:{model_id}:advise:search={int(bool(enable_search))}"
+                        if advise_mode
+                        else f"model:{model_id}:search={int(bool(enable_search))}"
+                    )
                 )
             )
         )
@@ -2565,40 +2747,77 @@ def _ask_agentspace_inner(
         effective_session = format_delete_session_name(effective_session)
         reused_existing_session = True
 
-    full_prompt = prompt
-    if python_pptx:
-        import pptx_lxml_wrapper
+    prior_hashes = (
+        get_session_context_hashes(effective_state_tag, effective_session)
+        if (reused_existing_session and effective_state_tag and effective_session)
+        else {}
+    )
+    pending_hashes: dict[str, str] = {}
 
-        full_prompt = f"{pptx_lxml_wrapper.PYTHON_PPTX_PROMPT_PREFIX}{full_prompt}"
-    if skill_name and f"mention://?uri={resolved_agent}" not in full_prompt:
-        mention_pill = f"[{skill_name}](mention://?uri={resolved_agent})"
+    def _build_full_prompt(is_reused: bool) -> tuple[str, list[str], list[str]]:
+        f_prompt = prompt
         if python_pptx:
-            full_prompt = (
-                f"{mention_pill} First call `load_skill` for `{skill_name}` and follow its V2.0 instructions:\n\n{full_prompt}"
-            )
-        else:
-            full_prompt = (
-                f"{mention_pill} {full_prompt}"
-            )
+            import pptx_lxml_wrapper
+            f_prompt = f"{pptx_lxml_wrapper.PYTHON_PPTX_PROMPT_PREFIX}{f_prompt}"
+        if skill_name and f"mention://?uri={resolved_agent}" not in f_prompt:
+            mention_pill = f"[{skill_name}](mention://?uri={resolved_agent})"
+            if python_pptx:
+                f_prompt = (
+                    f"{mention_pill} First call `load_skill` for `{skill_name}` and follow its V2.0 instructions:\n\n{f_prompt}"
+                )
+            else:
+                f_prompt = f"{mention_pill} {f_prompt}"
 
-    if advise_mode:
-        full_prompt = f"{ADVISOR_SYSTEM_PREAMBLE}\n\n--- TASK ---\n{full_prompt}"
+        if advise_mode:
+            preamble = ADVISOR_FOLLOWUP_PREAMBLE if is_reused else ADVISOR_SYSTEM_PREAMBLE
+            f_prompt = f"{preamble}\n\n--- TASK ---\n{f_prompt}"
 
-    context_blocks: list[str] = []
-    if include_tree:
-        context_blocks.append(_build_repo_tree(cwd=cwd))
+        c_blocks: list[str] = []
+        if include_tree:
+            tree_str = _build_repo_tree(cwd=cwd)
+            tree_hash = hashlib.sha256(tree_str.encode("utf-8")).hexdigest()
+            if is_reused and prior_hashes.get("__repo_tree__") == tree_hash:
+                c_blocks.append(f"--- REPO FILE TREE UNCHANGED IN SESSION (sha256={tree_hash[:12]}) ---")
+            else:
+                c_blocks.append(tree_str)
+                pending_hashes["__repo_tree__"] = tree_hash
 
-    attached_files: list[str] = []
-    if input_files:
-        expanded = _expand_input_paths(input_files, cwd=cwd)
-        for abs_fp, display_path in expanded:
-            with open(abs_fp, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            attached_files.append(abs_fp)
-            context_blocks.append(f"--- BEGIN FILE: {display_path} ---\n{content}\n--- END FILE: {display_path} ---")
+        att_files: list[str] = []
+        sk_files: list[str] = []
+        if input_files:
+            expanded, sk_files = _expand_input_paths_with_report(input_files, cwd=cwd)
+            for abs_fp, display_path in expanded:
+                with open(abs_fp, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                att_files.append(abs_fp)
+                file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if is_reused and prior_hashes.get(abs_fp) == file_hash:
+                    line_cnt = len(content.splitlines())
+                    c_blocks.append(
+                        f"--- FILE UNCHANGED IN SESSION: {display_path} (sha256={file_hash[:12]}, {line_cnt} lines) ---"
+                    )
+                else:
+                    pending_hashes[abs_fp] = file_hash
+                    body_out = (
+                        "\n".join(f"{idx}: {ln}" for idx, ln in enumerate(content.splitlines(), start=1))
+                        if advise_mode
+                        else content
+                    )
+                    c_blocks.append(
+                        f"--- BEGIN FILE: {display_path} ---\n{body_out}\n--- END FILE: {display_path} ---"
+                    )
+            if sk_files:
+                c_blocks.append(
+                    "--- OMITTED FILES (budget limit; request via [NEED_CONTEXT] if needed) ---\n"
+                    + "\n".join(sk_files)
+                    + "\n--- END OMITTED FILES ---"
+                )
 
-    if context_blocks:
-        full_prompt = f"{full_prompt}\n\n" + "\n\n".join(context_blocks)
+        if c_blocks:
+            f_prompt = f"{f_prompt}\n\n" + "\n\n".join(c_blocks)
+        return f_prompt, att_files, sk_files
+
+    full_prompt, attached_files, skipped_files = _build_full_prompt(is_reused=reused_existing_session)
 
     stream_req: dict = {
         "query": {"parts": [{"text": full_prompt}]},
@@ -2617,14 +2836,21 @@ def _ask_agentspace_inner(
         stream_req["agentsSpec"] = {
             "agentSpecs": [{"agentId": resolved_agent}]
         }
-        stream_req["toolsSpec"] = {
-            "vertexAiSearchSpec": {"dataStoreSpecs": onedrive_ds_specs},
+        agent_tools: dict = {
             "webGroundingSpec": {},
             "imageGenerationSpec": {},
             "videoGenerationSpec": {},
             "canvasSpec": {},
             "toolRegistry": "default_tool_registry",
         }
+        if (
+            enable_search
+            or resolved_agent in SLIDES_AGENT_IDS
+            or resolved_agent == "8458183310708652909"
+            or ("onedrive" in (prompt or "").lower() and not advise_mode)
+        ):
+            agent_tools["vertexAiSearchSpec"] = {"dataStoreSpecs": onedrive_ds_specs}
+        stream_req["toolsSpec"] = agent_tools
     else:
         stream_req["answerGenerationMode"] = "NORMAL"
         stream_req["assistGenerationConfig"] = {"modelId": model_id}
@@ -2632,7 +2858,7 @@ def _ask_agentspace_inner(
             stream_req["generationSpec"] = {
                 "thinkingConfig": {"thinkingLevel": thinking_level.upper()}
             }
-        if enable_search or skill_name or ("onedrive" in full_prompt.lower()):
+        if enable_search or skill_name or ("onedrive" in (prompt or "").lower() and not advise_mode):
             stream_req["toolsSpec"] = {
                 "vertexAiSearchSpec": {"dataStoreSpecs": onedrive_ds_specs},
                 "webGroundingSpec": {},
@@ -2660,28 +2886,74 @@ def _ask_agentspace_inner(
     timeout_sec = DEFAULT_STREAM_TIMEOUT
     chunks: list | dict = []
     xsrf_path = ""
-    for rpc_try in range(3):
-        chunks, xsrf_path = _post_widget_rpc("widgetStreamAssist", payload, csesidx=csesidx, timeout=timeout_sec)
-        stream_err = None
-        if isinstance(chunks, list):
-            for ch in chunks:
-                if isinstance(ch, dict) and "error" in ch:
-                    stream_err = ch["error"]
+    stale_recovered = False
+
+    while True:
+        chunks = []
+        for rpc_try in range(3):
+            try:
+                chunks, xsrf_path = _post_widget_rpc("widgetStreamAssist", payload, csesidx=csesidx, timeout=timeout_sec)
+            except urllib.error.HTTPError as he:
+                if he.code == 404 and reused_existing_session and not session and not stale_recovered:
+                    chunks = [{"error": {"code": 404, "status": "NOT_FOUND", "message": "Session not found"}}]
                     break
-        if stream_err and rpc_try < 2:
-            err_reason = ""
-            for det in stream_err.get("details", []):
-                if isinstance(det, dict) and det.get("reason"):
-                    err_reason = det["reason"]
+                raise
+            stream_err = None
+            if isinstance(chunks, list):
+                for ch in chunks:
+                    if isinstance(ch, dict) and "error" in ch:
+                        stream_err = ch["error"]
+                        break
+            if stream_err:
+                err_code = stream_err.get("code")
+                err_status = stream_err.get("status")
+                if (err_code == 404 or err_status == "NOT_FOUND") and reused_existing_session and not session and not stale_recovered:
                     break
-            wait_s = 5 * (rpc_try + 1)
+                is_transient = err_code in (429, 500, 503) or err_status in (
+                    "INTERNAL", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED"
+                )
+                if is_transient and rpc_try < 2:
+                    err_reason = ""
+                    for det in stream_err.get("details", []):
+                        if isinstance(det, dict) and det.get("reason"):
+                            err_reason = det["reason"]
+                            break
+                    wait_s = 5 * (rpc_try + 1)
+                    print(
+                        f"[Agentspace Stream Error: {err_reason or err_status or err_code} "
+                        f"(attempt {rpc_try + 1}/3). Retrying in {wait_s}s...]",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(wait_s)
+                    continue
+            break
+
+        hit_404 = False
+        if reused_existing_session and not session and not stale_recovered:
+            if isinstance(chunks, list):
+                for ch in chunks:
+                    if isinstance(ch, dict) and "error" in ch:
+                        e = ch["error"]
+                        if e.get("code") == 404 or e.get("status") == "NOT_FOUND":
+                            hit_404 = True
+                            break
+
+        if hit_404:
+            stale_recovered = True
             print(
-                f"[Agentspace Stream Error: {err_reason or stream_err.get('status') or stream_err.get('code')} "
-                f"(attempt {rpc_try + 1}/3). Retrying in {wait_s}s...]",
+                f"[Agentspace Session] Stale session {normalize_session_id(effective_session)} not found (404); clearing cache and retrying in fresh session...",
                 file=sys.stderr,
-                flush=True,
             )
-            time.sleep(wait_s)
+            clear_reusable_session(effective_state_tag, mode_key, deleted_session_id=effective_session)
+            effective_session = None
+            reused_existing_session = False
+            stream_req.pop("session", None)
+            prior_hashes = {}
+            pending_hashes = {}
+            full_prompt, attached_files, skipped_files = _build_full_prompt(is_reused=False)
+            stream_req["query"] = {"parts": [{"text": full_prompt}]}
+            payload["streamAssistRequest"] = stream_req
             continue
         break
 
@@ -2841,6 +3113,9 @@ def _ask_agentspace_inner(
                 elif "text" in content:
                     text_parts.append(content["text"])
 
+    if stream_errors and not "".join(text_parts).strip():
+        raise RuntimeError(f"Agentspace stream error: {json.dumps(stream_errors[-1])}")
+
     target_media_ids = final_media_file_ids or all_media_file_ids
     generated_media: list[dict] = []
     if session_name and target_media_ids:
@@ -2897,6 +3172,8 @@ def _ask_agentspace_inner(
                 is_media=is_media_turn,
                 update_active_slot=not isolated_from_busy_session,
             )
+            if pending_hashes and not delete_session_after and not session_deleted:
+                update_session_context_hashes(state_tag_to_save, session_name, pending_hashes)
             if is_media_turn and max_media_prompts > 0 and media_prompt_count >= max_media_prompts:
                 try:
                     delete_session(session_name, csesidx=csesidx)
@@ -2959,6 +3236,9 @@ def _ask_agentspace_inner(
             }
             saved_output_path = lxml_res["script_path"]
         except Exception as exc:
+            if target_pptx and os.path.isfile(target_pptx) and os.path.getsize(target_pptx) == 0:
+                with contextlib.suppress(Exception):
+                    os.remove(target_pptx)
             exported_artifacts = {"error": str(exc)}
     elif session_name and not session_deleted and (has_immersive_artifact or resolved_agent in SLIDES_AGENT_IDS):
         try:
@@ -2971,6 +3251,14 @@ def _ask_agentspace_inner(
             )
         except Exception:
             exported_artifacts = None
+
+    advisor_blocks = extract_advisor_blocks(final_text) if advise_mode else {"spec_block": None, "need_context_block": None}
+    advisor_spec_path = None
+    if advise_mode and saved_output_path and advisor_blocks.get("spec_block"):
+        base_no_ext, _ = os.path.splitext(saved_output_path)
+        advisor_spec_path = f"{base_no_ext}.spec.md"
+        with open(advisor_spec_path, "w", encoding="utf-8") as sf:
+            sf.write(advisor_blocks["spec_block"] + "\n")
 
     return {
         "text": final_text,
@@ -2987,6 +3275,11 @@ def _ask_agentspace_inner(
         "agent": resolved_agent,
         "model": model_id if not resolved_agent else f"agent:{resolved_agent}",
         "attached_files": attached_files,
+        "skipped_files": skipped_files,
+        "advisor_spec": advisor_blocks.get("spec_block"),
+        "advisor_spec_path": advisor_spec_path,
+        "need_context": advisor_blocks.get("need_context_block"),
+        "stream_errors": stream_errors,
         "saved_output_path": saved_output_path,
         "exported_artifacts": exported_artifacts,
         "line_count": len(final_text.splitlines()) if final_text else 0,
@@ -3447,14 +3740,38 @@ def main():
         if args.json:
             print(json.dumps(res, indent=2))
         elif effective_summary and res.get("saved_output_path"):
-            preview = res["text"][: args.max_preview_chars]
-            if len(res["text"]) > args.max_preview_chars:
-                preview += "\n... [truncated in stdout to save AGY tokens]"
-            print(
-                f"Saved full response ({res['line_count']} lines, {res['char_count']} chars) to:\n"
-                f"  {res['saved_output_path']}\n\n"
-                f"Preview:\n{preview}"
-            )
+            if args.advise:
+                if res.get("need_context"):
+                    print(
+                        f"Saved full Advisor plan ({res['line_count']} lines, {res['char_count']} chars) to:\n"
+                        f"  {res['saved_output_path']}\n\n"
+                        f"**[NEED_CONTEXT] DETECTED:**\n{res['need_context'][:4000]}"
+                    )
+                elif res.get("advisor_spec"):
+                    spec_path_str = f"\n  Spec file: {res['advisor_spec_path']}" if res.get("advisor_spec_path") else ""
+                    print(
+                        f"Saved full Advisor plan ({res['line_count']} lines, {res['char_count']} chars) to:\n"
+                        f"  {res['saved_output_path']}{spec_path_str}\n\n"
+                        f"**Extracted <antigravity_spec>:**\n{res['advisor_spec'][:4000]}"
+                    )
+                else:
+                    preview = res["text"][: args.max_preview_chars]
+                    if len(res["text"]) > args.max_preview_chars:
+                        preview += "\n... [truncated in stdout to save AGY tokens]"
+                    print(
+                        f"Saved full response ({res['line_count']} lines, {res['char_count']} chars) to:\n"
+                        f"  {res['saved_output_path']}\n\n"
+                        f"Preview:\n{preview}"
+                    )
+            else:
+                preview = res["text"][: args.max_preview_chars]
+                if len(res["text"]) > args.max_preview_chars:
+                    preview += "\n... [truncated in stdout to save AGY tokens]"
+                print(
+                    f"Saved full response ({res['line_count']} lines, {res['char_count']} chars) to:\n"
+                    f"  {res['saved_output_path']}\n\n"
+                    f"Preview:\n{preview}"
+                )
             for m in res.get("generated_media", []):
                 print(f"\n[Auto-Downloaded {m['media_type'].upper()} ({m['mime_type']}): {m['path']} ({m['bytes']:,} bytes)]")
             if res.get("exported_artifacts"):

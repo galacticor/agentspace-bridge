@@ -11,6 +11,11 @@ import json
 import os
 import sys
 import threading
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
 from agentspace_cli import (
     ask_agentspace,
     cleanup_media_sessions,
@@ -54,7 +59,8 @@ TOOLS = [
                         "Optional agent alias ('netra' for Netra Multi-Agent Coordinator 17783079275007264980, "
                         "'ace' for ACE Platform 8461818071814491910, 'office-workflow-suite' / 'slides' / 'pptx' for "
                         "Skill Agent 14950672669329422296, 'office-creator' for Office File Creator 17216682253898748109, "
-                        "'office-creator-2' / 'office2' for Office File Creator 2.0 2291045905737541211, "
+                        "'office-creator-2' / 'office2' / 'office-v2' for Office File Creator 2.0 2291045905737541211, "
+                        "'workflow' / 'netra-office-workflow' for 8458183310708652909, "
                         "'agb' for 18420663427156982501, 'catalyst' for app_catalyst_agent) or raw numeric Agent ID."
                     ),
                 },
@@ -114,17 +120,12 @@ TOOLS = [
                 "summary_only": {
                     "type": "boolean",
                     "default": False,
-                    "description": "When saving output to a file, set to true to return only the saved file path and a short 500-char preview to save Antigravity context tokens.",
+                    "description": "When saving output to a file, set to true to return only the saved file path and a short preview to save Antigravity context tokens.",
                 },
                 "max_media_prompts": {
                     "type": "integer",
                     "default": DEFAULT_MAX_MEDIA_PROMPTS,
                     "description": "Auto-clear/rotate media generation session after N prompts (default: 3).",
-                },
-                "csesidx": {
-                    "type": "string",
-                    "default": DEFAULT_CSESIDX,
-                    "description": "Optional csesidx query parameter from the vertexaisearch.cloud.google URL.",
                 },
             },
             "required": ["prompt"],
@@ -186,11 +187,6 @@ TOOLS = [
                     "default": "advisor_plan.md",
                     "description": "Filename to save the plan under ./outputs/<session_tag>/ (default: 'advisor_plan.md').",
                 },
-                "csesidx": {
-                    "type": "string",
-                    "default": DEFAULT_CSESIDX,
-                    "description": "Optional csesidx query parameter.",
-                },
             },
             "required": ["task"],
         },
@@ -212,11 +208,6 @@ TOOLS = [
                     "type": "boolean",
                     "default": True,
                     "description": "If true (default), deletes only media sessions and single-asset sub-sessions while preserving Netra/Search/Slides sessions.",
-                },
-                "csesidx": {
-                    "type": "string",
-                    "default": DEFAULT_CSESIDX,
-                    "description": "Optional csesidx query parameter.",
                 },
             },
             "required": ["session_tag"],
@@ -240,11 +231,6 @@ TOOLS = [
                     "default": 0,
                     "description": "Number of most recent media sessions to keep (default: 0).",
                 },
-                "csesidx": {
-                    "type": "string",
-                    "default": DEFAULT_CSESIDX,
-                    "description": "Optional csesidx query parameter.",
-                },
             },
         },
     },
@@ -261,11 +247,6 @@ TOOLS = [
                     "type": "string",
                     "description": "The session ID or full session resource path (`collections/.../sessions/<id>`) to delete.",
                 },
-                "csesidx": {
-                    "type": "string",
-                    "default": DEFAULT_CSESIDX,
-                    "description": "Optional csesidx query parameter from the vertexaisearch.cloud.google URL.",
-                },
             },
             "required": ["session_id"],
         },
@@ -280,11 +261,6 @@ TOOLS = [
                     "type": "integer",
                     "default": 20,
                     "description": "Maximum number of recent sessions to return (default: 20).",
-                },
-                "csesidx": {
-                    "type": "string",
-                    "default": DEFAULT_CSESIDX,
-                    "description": "Optional csesidx query parameter from the vertexaisearch.cloud.google URL.",
                 },
             },
         },
@@ -312,11 +288,6 @@ TOOLS = [
                 "session_tag": {
                     "type": "string",
                     "description": "Antigravity conversation ID prefix (e.g. '95e5efcf').",
-                },
-                "csesidx": {
-                    "type": "string",
-                    "default": DEFAULT_CSESIDX,
-                    "description": "Optional csesidx query parameter.",
                 },
             },
         },
@@ -367,9 +338,9 @@ def handle_request(msg: dict) -> dict | None:
             "result": {"tools": TOOLS},
         }
     elif method == "tools/call":
-        params = msg.get("params", {})
+        params = msg.get("params") or {}
         name = params.get("name")
-        args = params.get("arguments", {})
+        args = params.get("arguments") or {}
 
         try:
             if name == "agentspace_ask":
@@ -447,19 +418,38 @@ def handle_request(msg: dict) -> dict | None:
                     advise_mode=True,
                     cwd=args.get("cwd"),
                 )
-                preview = res["text"][:600]
-                if len(res["text"]) > 600:
-                    preview += "\n... [truncated to save AGY context tokens]"
-                need_ctx_note = (
-                    "\n\n**[NEED_CONTEXT] DETECTED:** The Advisor requested additional files/outputs. "
-                    "Read the saved plan, gather the requested context, and call `agentspace_advise` again with the same `session_tag`."
-                    if "[NEED_CONTEXT]" in res["text"]
+                skipped_note = (
+                    f"\n\n**Omitted Files (budget cap):** `{', '.join(res['skipped_files'][:10])}`"
+                    if res.get("skipped_files")
                     else ""
                 )
+                if res.get("need_context"):
+                    body_preview = (
+                        "**[NEED_CONTEXT] DETECTED:** Gather the requested files/outputs below and call "
+                        "`agentspace_advise` again with the same `session_tag`:\n\n"
+                        f"{res['need_context'][:4000]}"
+                    )
+                elif res.get("advisor_spec"):
+                    spec_txt = res["advisor_spec"]
+                    if len(spec_txt) <= 4000:
+                        body_preview = (
+                            f"**Extracted `<antigravity_spec>`** (also saved to `{res.get('advisor_spec_path', '')}` — "
+                            f"apply directly without reading full `advisor_plan.md`):\n\n{spec_txt}"
+                        )
+                    else:
+                        body_preview = (
+                            f"**Spec exceeds inline cap ({len(spec_txt)} chars).** Read ONLY `{res.get('advisor_spec_path', '')}` "
+                            f"(skip full narrative `advisor_plan.md`).\n\n{spec_txt[:1500]}\n... [truncated]"
+                        )
+                else:
+                    preview = res["text"][:800]
+                    if len(res["text"]) > 800:
+                        preview += "\n... [truncated; no <antigravity_spec> tag found — read saved plan]"
+                    body_preview = f"**Preview:**\n{preview}"
+
                 out_text = (
-                    f"Saved Advisor plan ({res['line_count']} lines, {res['char_count']} chars) to:\n"
-                    f"`{res.get('saved_output_path', '')}`{need_ctx_note}\n\n"
-                    f"**Preview:**\n{preview}"
+                    f"Saved full Advisor rationale ({res['line_count']} lines, {res['char_count']} chars) to "
+                    f"`{res.get('saved_output_path', '')}`.{skipped_note}\n\n{body_preview}"
                 )
                 if res.get("session"):
                     out_text += f"\n\n---\n_Agentspace Session: `{res['session']}` (Target: `{res['model']}`)_"
@@ -647,6 +637,7 @@ def main():
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.flush()
     # Duplicate true OS FD 1 for JSON-RPC, then redirect FD 1 -> stderr so child subprocesses cannot pollute stdout
     proto_fd = os.dup(sys.stdout.fileno())
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())

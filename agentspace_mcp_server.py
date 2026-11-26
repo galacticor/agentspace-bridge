@@ -135,7 +135,7 @@ TOOLS = [
         "name": "agentspace_advise",
         "description": (
             "Advisor Planner Mode: delegate complex multi-file architecture, concurrency/refactoring plans, "
-            "heavy BigQuery SQL design, or root-cause synthesis to Gemini 4 Carbon (HIGH thinking) while keeping "
+            "heavy BigQuery SQL design, or root-cause synthesis to Gemini 4 Carbon (MEDIUM thinking by default; pass thinking_level='HIGH' when needed) while keeping "
             "a fast/low-quota native model in Antigravity as Executor. Attaches a compact repo tree + every relevant "
             "local file via `files` (attach config/setup/doc files upfront to avoid `[NEED_CONTEXT]` round-trips) "
             "and saves an Implementation Manifest to `./outputs/<session_tag>/`. For parallel subagents, pass "
@@ -170,8 +170,8 @@ TOOLS = [
                 "thinking_level": {
                     "type": "string",
                     "enum": ["LOW", "MEDIUM", "HIGH", "NONE"],
-                    "default": "HIGH",
-                    "description": "Thinking effort level (default: HIGH).",
+                    "default": "MEDIUM",
+                    "description": "Thinking effort level (default: MEDIUM; pass HIGH when explicitly requested).",
                 },
                 "session_tag": {
                     "type": "string",
@@ -407,7 +407,7 @@ def handle_request(msg: dict) -> dict | None:
                 res = ask_agentspace(
                     prompt=args["task"],
                     model_id=args.get("model", "gemini-4-carbon"),
-                    thinking_level=args.get("thinking_level", "HIGH"),
+                    thinking_level=args.get("thinking_level", "MEDIUM"),
                     input_files=args.get("files"),
                     save_output=True,
                     output_filename=args.get("output_filename", "advisor_plan.md"),

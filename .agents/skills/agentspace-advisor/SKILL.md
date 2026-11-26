@@ -14,7 +14,7 @@ description: >-
 
 - **USE `agentspace-advisor` when:**
   - Antigravity is running a lighter local model (e.g., Hydrogen) and needs deep architectural reasoning, multi-file refactoring plans, or complex root-cause debugging.
-  - You want **Gemini 4 Argon (`gemini-4-argon`)** or **Gemini 4 Carbon (`gemini-4-carbon`)** with `--thinking HIGH` to review local files and produce a step-by-step implementation manifest.
+  - You want **Gemini 4 Argon (`gemini-4-argon`)** or **Gemini 4 Carbon (`gemini-4-carbon`)** with `--thinking MEDIUM` (or `--thinking HIGH` when explicitly requested) to review local files and produce a step-by-step implementation manifest.
 - **DO NOT USE `agentspace-advisor` when:**
   - Performing trivial local edits, simple syntax/lint fixes, or routine unit-test loops. Keep those **100% local in Antigravity**.
 
@@ -25,7 +25,7 @@ description: >-
 1. **Attach Local Files, Directories, or Globs (`files` / `-f`):**
    - Never paste large file contents into the prompt. Pass files, directories (e.g. `src/`), or globs (e.g. `src/**/*.py`) directly so they are read from disk.
 2. **Use `agentspace_advise` (MCP) or `--advise` (CLI):**
-   - Automatically selects `gemini-4-carbon` + `HIGH` thinking, attaches a compact repo file tree (`include_tree=True` / `--tree`), injects the **Planner Implementation Manifest** framing, and saves to `advisor_plan.md` with `--summary-only`.
+   - Automatically selects `gemini-4-carbon` + `MEDIUM` thinking (override with `--thinking HIGH` / `thinking_level="HIGH"` when needed), attaches a compact repo file tree (`include_tree=True` / `--tree`), injects the **Planner Implementation Manifest** framing, and saves to `advisor_plan.md` with `--summary-only`.
 3. **Maintain Session Continuity (`session_tag`):**
    - Always pass `session_tag` (`<8_char_conv_id>`) so follow-up turns reuse the same `[agy-bridge]` session without re-uploading earlier files.
 4. **Interactive `[NEED_CONTEXT]` Loop:**

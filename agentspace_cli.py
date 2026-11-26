@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
 import contextlib
 import glob
 import hashlib
@@ -783,6 +784,66 @@ def _post_widget_rpc(
             method="POST",
         )
         try:
+            if endpoint == "widgetStreamAssist":
+                first_frame_sec = max(600.0, float(timeout))
+                chunk_idle_sec = 90.0
+                max_wall_sec = max(600.0, float(timeout))
+                with urllib.request.urlopen(req, timeout=max(60.0, float(timeout))) as resp:
+                    if hasattr(resp, "fp") and hasattr(resp.fp, "raw") and hasattr(resp.fp.raw, "settimeout"):
+                        resp.fp.raw.settimeout(15.0)
+                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                    json_decoder = json.JSONDecoder()
+                    buf = ""
+                    salvaged: list[dict] = []
+                    start_ts = time.monotonic()
+                    last_semantic_ts = start_ts
+                    semantic_frames = 0
+                    read_fn = getattr(resp, "read1", resp.read)
+                    while True:
+                        now = time.monotonic()
+                        if now - start_ts > max_wall_sec:
+                            raise TimeoutError(f"widgetStreamAssist exceeded max_wall_sec={max_wall_sec}s")
+                        if semantic_frames == 0 and (now - start_ts > first_frame_sec):
+                            raise TimeoutError(f"widgetStreamAssist exceeded first_semantic_frame_sec={first_frame_sec}s")
+                        if semantic_frames > 0 and (now - last_semantic_ts > chunk_idle_sec):
+                            raise TimeoutError(f"widgetStreamAssist exceeded chunk_idle_sec={chunk_idle_sec}s")
+                        try:
+                            chunk = read_fn(16384)
+                        except (TimeoutError, socket.timeout):
+                            continue
+                        except http.client.IncompleteRead as ir:
+                            partial = getattr(ir, "partial", b"")
+                            if partial:
+                                buf += decoder.decode(partial, final=True)
+                            break
+                        if not chunk:
+                            buf += decoder.decode(b"", final=True)
+                            break
+                        buf += decoder.decode(chunk, final=False)
+                        idx = 0
+                        n = len(buf)
+                        while idx < n:
+                            while idx < n and buf[idx] in " \t\r\n,[]":
+                                idx += 1
+                            if idx >= n:
+                                break
+                            try:
+                                obj, next_idx = json_decoder.raw_decode(buf, idx)
+                                salvaged.append(obj)
+                                idx = next_idx
+                                if isinstance(obj, dict) and (
+                                    "statusUpdates" in obj
+                                    or "plannerSteps" in obj
+                                    or "thought" in obj
+                                    or ("answer" in obj and isinstance(obj["answer"], dict) and "replies" in obj["answer"])
+                                ):
+                                    semantic_frames += 1
+                                    last_semantic_ts = time.monotonic()
+                            except json.JSONDecodeError:
+                                break
+                        buf = buf[idx:]
+                    return salvaged, xsrf_path
+
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 try:
                     raw = resp.read().decode("utf-8")
@@ -1028,6 +1089,8 @@ def clear_reusable_session(
             ]
             if isinstance(state.get("context_hashes"), dict):
                 state["context_hashes"].pop(short_del, None)
+            if isinstance(state.get("context_file_ids"), dict):
+                state["context_file_ids"].pop(short_del, None)
         state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _atomic_write_json(state_path, state)
 
@@ -1096,6 +1159,79 @@ def update_session_context_hashes(
         if isinstance(bucket, dict):
             bucket.update(new_hashes)
         _atomic_write_json(state_path, state)
+
+
+CONTEXT_INLINE_MAX_BYTES = 96_000
+CONTEXT_MAX_TOKENS = 600_000
+
+
+def get_session_context_file_id(
+    session_tag: str | None,
+    session_id: str | None,
+    bundle_hash: str,
+) -> str | None:
+    if not session_tag or not session_id or not bundle_hash:
+        return None
+    state, _ = _load_session_state(session_tag)
+    short_id = normalize_session_id(session_id)
+    bucket = state.get("context_file_ids", {}).get(short_id, {})
+    if isinstance(bucket, dict):
+        val = bucket.get(bundle_hash)
+        return str(val) if val else None
+    return None
+
+
+def update_session_context_file_id(
+    session_tag: str | None,
+    session_id: str | None,
+    bundle_hash: str,
+    file_id: str,
+) -> None:
+    state_path = _get_session_state_path(session_tag)
+    if not state_path or not session_id or not bundle_hash or not file_id:
+        return
+    short_id = normalize_session_id(session_id)
+    with _FileLock(f"{state_path}.lock", blocking=True, timeout_sec=15):
+        state, _ = _load_session_state(session_tag)
+        bucket = state.setdefault("context_file_ids", {}).setdefault(short_id, {})
+        if isinstance(bucket, dict):
+            bucket[bundle_hash] = file_id
+        _atomic_write_json(state_path, state)
+
+
+def _upload_context_bundle(
+    sess_name: str,
+    bundle_bytes: bytes,
+    bundle_hash: str,
+    csesidx: str = DEFAULT_CSESIDX,
+    timeout: int = 60,
+) -> tuple[str, int]:
+    """Upload a bundled .txt context payload via widgetAddContextFile and enforce tokenCount < 600,000."""
+    payload = {
+        "configId": WIDGET_CONFIG_ID,
+        "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+        "addContextFileRequest": {
+            "name": sess_name,
+            "fileName": f"context_bundle_{bundle_hash[:12]}.txt",
+            "mimeType": "text/plain",
+            "fileContents": base64.b64encode(bundle_bytes).decode("ascii"),
+        },
+    }
+    resp, _ = _post_widget_rpc("widgetAddContextFile", payload, csesidx=csesidx, timeout=timeout)
+    if not isinstance(resp, dict):
+        raise RuntimeError(f"Unexpected widgetAddContextFile response: {resp!r}")
+    add_resp = resp.get("addContextFileResponse")
+    if not isinstance(add_resp, dict):
+        raise RuntimeError(f"widgetAddContextFile missing addContextFileResponse: {resp!r}")
+    file_id = add_resp.get("fileId")
+    token_count = int(add_resp.get("tokenCount", 0) or 0)
+    if token_count >= CONTEXT_MAX_TOKENS:
+        raise ValueError(
+            f"Context bundle tokenCount={token_count} exceeds limit of {CONTEXT_MAX_TOKENS}"
+        )
+    if not file_id:
+        raise RuntimeError(f"widgetAddContextFile did not return fileId: {resp!r}")
+    return str(file_id), token_count
 
 
 def finish_task_sessions(
@@ -2754,7 +2890,7 @@ def _ask_agentspace_inner(
     )
     pending_hashes: dict[str, str] = {}
 
-    def _build_full_prompt(is_reused: bool) -> tuple[str, list[str], list[str]]:
+    def _build_full_prompt(is_reused: bool) -> tuple[str, list[str], list[str], list[str]]:
         f_prompt = prompt
         if python_pptx:
             import pptx_lxml_wrapper
@@ -2773,9 +2909,11 @@ def _ask_agentspace_inner(
             f_prompt = f"{preamble}\n\n--- TASK ---\n{f_prompt}"
 
         c_blocks: list[str] = []
+        raw_c_blocks: list[str] = []
         if include_tree:
             tree_str = _build_repo_tree(cwd=cwd)
             tree_hash = hashlib.sha256(tree_str.encode("utf-8")).hexdigest()
+            raw_c_blocks.append(tree_str)
             if is_reused and prior_hashes.get("__repo_tree__") == tree_hash:
                 c_blocks.append(f"--- REPO FILE TREE UNCHANGED IN SESSION (sha256={tree_hash[:12]}) ---")
             else:
@@ -2791,6 +2929,13 @@ def _ask_agentspace_inner(
                     content = f.read()
                 att_files.append(abs_fp)
                 file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                body_out = (
+                    "\n".join(f"{idx}: {ln}" for idx, ln in enumerate(content.splitlines(), start=1))
+                    if advise_mode
+                    else content
+                )
+                raw_block = f"--- BEGIN FILE: {display_path} ---\n{body_out}\n--- END FILE: {display_path} ---"
+                raw_c_blocks.append(raw_block)
                 if is_reused and prior_hashes.get(abs_fp) == file_hash:
                     line_cnt = len(content.splitlines())
                     c_blocks.append(
@@ -2798,30 +2943,55 @@ def _ask_agentspace_inner(
                     )
                 else:
                     pending_hashes[abs_fp] = file_hash
-                    body_out = (
-                        "\n".join(f"{idx}: {ln}" for idx, ln in enumerate(content.splitlines(), start=1))
-                        if advise_mode
-                        else content
-                    )
-                    c_blocks.append(
-                        f"--- BEGIN FILE: {display_path} ---\n{body_out}\n--- END FILE: {display_path} ---"
-                    )
+                    c_blocks.append(raw_block)
             if sk_files:
-                c_blocks.append(
+                omitted_block = (
                     "--- OMITTED FILES (budget limit; request via [NEED_CONTEXT] if needed) ---\n"
                     + "\n".join(sk_files)
                     + "\n--- END OMITTED FILES ---"
                 )
+                c_blocks.append(omitted_block)
+                raw_c_blocks.append(omitted_block)
 
+        nonlocal pending_file_id
+        context_file_ids: list[str] = []
         if c_blocks:
-            f_prompt = f"{f_prompt}\n\n" + "\n\n".join(c_blocks)
-        return f_prompt, att_files, sk_files
+            bundle_text = "\n\n".join(c_blocks)
+            bundle_bytes = bundle_text.encode("utf-8")
+            raw_bundle_bytes = "\n\n".join(raw_c_blocks).encode("utf-8")
+            raw_bundle_hash = hashlib.sha256(raw_bundle_bytes).hexdigest()
+            cached_fid = (
+                get_session_context_file_id(effective_state_tag, effective_session, raw_bundle_hash)
+                if (is_reused and effective_state_tag and effective_session and len(raw_bundle_bytes) > CONTEXT_INLINE_MAX_BYTES)
+                else None
+            )
+            if cached_fid:
+                pending_file_id = (raw_bundle_hash, cached_fid)
+                context_file_ids.append(cached_fid)
+            elif len(bundle_bytes) <= CONTEXT_INLINE_MAX_BYTES:
+                f_prompt = f"{f_prompt}\n\n{bundle_text}"
+            else:
+                sess_for_upload = effective_session or format_delete_session_name("-")
+                file_id, _ = _upload_context_bundle(
+                    sess_for_upload,
+                    bundle_bytes,
+                    raw_bundle_hash,
+                    csesidx=csesidx,
+                )
+                pending_file_id = (raw_bundle_hash, file_id)
+                context_file_ids.append(file_id)
+        return f_prompt, att_files, sk_files, context_file_ids
 
-    full_prompt, attached_files, skipped_files = _build_full_prompt(is_reused=reused_existing_session)
+    pending_file_id: tuple[str, str] | None = None
+    full_prompt, attached_files, skipped_files, context_file_ids = _build_full_prompt(
+        is_reused=reused_existing_session
+    )
 
     stream_req: dict = {
         "query": {"parts": [{"text": full_prompt}]},
     }
+    if context_file_ids:
+        stream_req["fileIds"] = context_file_ids
 
     if effective_session:
         stream_req["session"] = effective_session
@@ -2867,6 +3037,12 @@ def _ask_agentspace_inner(
                 "canvasSpec": {},
                 "toolRegistry": "default_tool_registry",
             }
+        elif advise_mode:
+            stream_req["toolsSpec"] = {
+                "webGroundingSpec": {},
+                "toolRegistry": "default_tool_registry",
+            }
+            stream_req["assistSkippingMode"] = "REQUEST_ASSIST"
         else:
             stream_req["toolsSpec"] = {
                 "webGroundingSpec": {},
@@ -2951,8 +3127,12 @@ def _ask_agentspace_inner(
             stream_req.pop("session", None)
             prior_hashes = {}
             pending_hashes = {}
-            full_prompt, attached_files, skipped_files = _build_full_prompt(is_reused=False)
+            full_prompt, attached_files, skipped_files, context_file_ids = _build_full_prompt(is_reused=False)
             stream_req["query"] = {"parts": [{"text": full_prompt}]}
+            if context_file_ids:
+                stream_req["fileIds"] = context_file_ids
+            else:
+                stream_req.pop("fileIds", None)
             payload["streamAssistRequest"] = stream_req
             continue
         break
@@ -3174,6 +3354,10 @@ def _ask_agentspace_inner(
             )
             if pending_hashes and not delete_session_after and not session_deleted:
                 update_session_context_hashes(state_tag_to_save, session_name, pending_hashes)
+            if pending_file_id and not delete_session_after and not session_deleted:
+                update_session_context_file_id(
+                    state_tag_to_save, session_name, pending_file_id[0], pending_file_id[1]
+                )
             if is_media_turn and max_media_prompts > 0 and media_prompt_count >= max_media_prompts:
                 try:
                     delete_session(session_name, csesidx=csesidx)
@@ -3338,7 +3522,7 @@ def main():
     parser.add_argument(
         "--advise",
         action="store_true",
-        help="Advisor Planner Mode: use gemini-4-carbon + HIGH thinking, attach repo tree, inject Implementation Manifest framing, and save to advisor_plan.md (--summary-only)",
+        help="Advisor Planner Mode: use gemini-4-carbon + MEDIUM thinking (override with --thinking HIGH), attach repo tree, inject Implementation Manifest framing, and save to advisor_plan.md (--summary-only)",
     )
     parser.add_argument(
         "--tree",
@@ -3714,7 +3898,7 @@ def main():
             args.agent = "office-workflow-suite"
 
         effective_model = "gemini-4-carbon" if (args.advise and args.model == DEFAULT_MODEL) else args.model
-        effective_thinking = "HIGH" if (args.advise and args.thinking == DEFAULT_THINKING) else args.thinking
+        effective_thinking = "MEDIUM" if (args.advise and args.thinking == DEFAULT_THINKING) else args.thinking
         effective_output = args.output_filename or ("advisor_plan.md" if args.advise else None)
         effective_summary = bool(args.summary_only or args.advise or use_native_pptx)
 

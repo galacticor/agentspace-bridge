@@ -753,6 +753,7 @@ def _post_widget_rpc(
     csesidx: str = DEFAULT_CSESIDX,
     timeout: int = 120,
     auto_refresh: bool = True,
+    strict_timeout: bool = False,
 ) -> tuple[dict | list, str]:
     try:
         xsrf, xsrf_path = load_xsrf()
@@ -785,12 +786,16 @@ def _post_widget_rpc(
         )
         try:
             if endpoint == "widgetStreamAssist":
-                first_frame_sec = max(600.0, float(timeout))
-                chunk_idle_sec = 90.0
-                max_wall_sec = max(600.0, float(timeout))
-                with urllib.request.urlopen(req, timeout=max(60.0, float(timeout))) as resp:
+                if strict_timeout:
+                    first_frame_sec = max(10.0, float(timeout))
+                    max_wall_sec = max(10.0, float(timeout))
+                else:
+                    first_frame_sec = max(600.0, float(timeout))
+                    max_wall_sec = max(600.0, float(timeout))
+                chunk_idle_sec = min(90.0, max_wall_sec)
+                with urllib.request.urlopen(req, timeout=max(10.0, float(timeout)) if strict_timeout else max(60.0, float(timeout))) as resp:
                     if hasattr(resp, "fp") and hasattr(resp.fp, "raw") and hasattr(resp.fp.raw, "settimeout"):
-                        resp.fp.raw.settimeout(15.0)
+                        resp.fp.raw.settimeout(min(15.0, max_wall_sec))
                     decoder = codecs.getincrementaldecoder("utf-8")("replace")
                     json_decoder = json.JSONDecoder()
                     buf = ""
@@ -801,12 +806,18 @@ def _post_widget_rpc(
                     read_fn = getattr(resp, "read1", resp.read)
                     while True:
                         now = time.monotonic()
+                        timeout_reason = None
                         if now - start_ts > max_wall_sec:
-                            raise TimeoutError(f"widgetStreamAssist exceeded max_wall_sec={max_wall_sec}s")
-                        if semantic_frames == 0 and (now - start_ts > first_frame_sec):
-                            raise TimeoutError(f"widgetStreamAssist exceeded first_semantic_frame_sec={first_frame_sec}s")
-                        if semantic_frames > 0 and (now - last_semantic_ts > chunk_idle_sec):
-                            raise TimeoutError(f"widgetStreamAssist exceeded chunk_idle_sec={chunk_idle_sec}s")
+                            timeout_reason = f"widgetStreamAssist exceeded max_wall_sec={max_wall_sec}s"
+                        elif semantic_frames == 0 and (now - start_ts > first_frame_sec):
+                            timeout_reason = f"widgetStreamAssist exceeded first_semantic_frame_sec={first_frame_sec}s"
+                        elif semantic_frames > 0 and (now - last_semantic_ts > chunk_idle_sec):
+                            timeout_reason = f"widgetStreamAssist exceeded chunk_idle_sec={chunk_idle_sec}s"
+                        if timeout_reason:
+                            if salvaged:
+                                salvaged.append({"_partial_timeout": True, "_timeout_reason": timeout_reason})
+                                return salvaged, xsrf_path
+                            raise TimeoutError(timeout_reason)
                         try:
                             chunk = read_fn(16384)
                         except (TimeoutError, socket.timeout):
@@ -892,7 +903,9 @@ def _post_widget_rpc(
                 time.sleep(1.5 * transient_tries)
                 continue
             raise
-        except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.RemoteDisconnected):
+        except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.RemoteDisconnected) as exc:
+            if strict_timeout and isinstance(exc, (TimeoutError, socket.timeout)):
+                raise
             if transient_tries < 2:
                 transient_tries += 1
                 time.sleep(1.5 * transient_tries)
@@ -1425,6 +1438,71 @@ def list_sessions(limit: int = 20, csesidx: str = DEFAULT_CSESIDX) -> list[dict]
             "first_query": first_query,
         })
     return results
+
+
+def get_session_turns(
+    session_id: str | None = None,
+    session_tag: str | None = None,
+    last_turn_only: bool = True,
+    csesidx: str = DEFAULT_CSESIDX,
+) -> dict:
+    """Fetches turns and answer details for a session via widgetGetSession (useful to recover timed-out runs)."""
+    short_sess = normalize_session_id(session_id) if session_id else ""
+    if not short_sess and session_tag:
+        state, _ = _load_session_state(session_tag)
+        sessions_map = state.get("sessions", {}) if isinstance(state, dict) else {}
+        for cached in reversed(list(sessions_map.values())):
+            if isinstance(cached, str) and cached.strip():
+                short_sess = normalize_session_id(cached)
+                break
+    if not short_sess:
+        raise ValueError("Provide either `session_id` or a `session_tag` with an active Agentspace session.")
+
+    payload = {
+        "configId": WIDGET_CONFIG_ID,
+        "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+        "getSessionRequest": {
+            "name": short_sess,
+            "includeAnswerDetails": True,
+            "includeMostRecentSearchResponseDetails": True,
+        },
+    }
+    sess_data, _ = _post_widget_rpc("widgetGetSession", payload, csesidx=csesidx, timeout=60)
+    sess_obj = sess_data.get("session", sess_data) if isinstance(sess_data, dict) else {}
+    raw_turns = sess_obj.get("turns", []) if isinstance(sess_obj, dict) else []
+    selected = raw_turns[-1:] if (last_turn_only and raw_turns) else raw_turns
+
+    parsed_turns = []
+    for idx, turn in enumerate(selected):
+        q_text = turn.get("query", {}).get("text", "") if isinstance(turn.get("query"), dict) else ""
+        daa = turn.get("detailedAssistAnswer", {}) if isinstance(turn.get("detailedAssistAnswer"), dict) else {}
+        parts: list[str] = []
+        for rep in daa.get("replies", []):
+            gc_content = rep.get("groundedContent", {}).get("content", {})
+            if gc_content.get("thought"):
+                continue
+            if gc_content.get("text"):
+                parts.append(gc_content["text"])
+            if gc_content.get("executableCode", {}).get("code"):
+                parts.append(f"```python\n{gc_content['executableCode']['code']}\n```")
+        if not parts and daa.get("answerText"):
+            parts.append(daa["answerText"])
+        parsed_turns.append({
+            "turn_index": (len(raw_turns) - 1) if last_turn_only else idx,
+            "state": daa.get("state", "UNKNOWN"),
+            "query": q_text[:300],
+            "text": "\n".join(parts).strip(),
+        })
+
+    latest_text = parsed_turns[-1]["text"] if parsed_turns else ""
+    return {
+        "session_id": short_sess,
+        "name": sess_obj.get("name", short_sess),
+        "display_name": sess_obj.get("displayName", "(Untitled)"),
+        "turns_count": len(raw_turns),
+        "turns": parsed_turns,
+        "latest_text": latest_text,
+    }
 
 
 def list_agents(include_skills: bool = True, csesidx: str = DEFAULT_CSESIDX) -> list[dict]:
@@ -2600,7 +2678,7 @@ _ANTIGRAVITY_SPEC_INLINE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _NEED_CONTEXT_RE = re.compile(
-    r"(?ms)^[ \t]*(?:#{1,6}[ \t]+|\*\*)?\[NEED[_]CONTEXT\](?:\*\*)?[ \t]*:?.*",
+    r"(?msi)^[ \t]*(?:>[ \t]*)?(?:[-*][ \t]+)?(?:#{1,6}[ \t]+|\*\*)?\[NEED[ _-]CONTEXT\](?:\*\*)?[ \t]*:?.*",
 )
 
 
@@ -2620,7 +2698,7 @@ def extract_advisor_blocks(text: str) -> dict[str, str | None]:
         return {"spec_block": None, "need_context_block": None}
     blocks = _ANTIGRAVITY_SPEC_RE.findall(text) or _ANTIGRAVITY_SPEC_INLINE_RE.findall(text)
     spec_block = blocks[-1].strip() if blocks else None
-    need_m = None if spec_block else _NEED_CONTEXT_RE.search(text)
+    need_m = _NEED_CONTEXT_RE.search(text)
     need_block = need_m.group(0).strip() if need_m else None
     return {"spec_block": spec_block, "need_context_block": need_block}
 
@@ -2793,6 +2871,7 @@ def ask_agentspace(
     include_tree: bool = False,
     advise_mode: bool = False,
     cwd: str | None = None,
+    timeout_sec: int | None = None,
 ) -> dict:
     with contextlib.ExitStack() as stack:
         return _ask_agentspace_inner(
@@ -2814,6 +2893,7 @@ def ask_agentspace(
             include_tree=include_tree,
             advise_mode=advise_mode,
             cwd=cwd,
+            timeout_sec=timeout_sec,
             _exit_stack=stack,
         )
 
@@ -2837,6 +2917,7 @@ def _ask_agentspace_inner(
     include_tree: bool = False,
     advise_mode: bool = False,
     cwd: str | None = None,
+    timeout_sec: int | None = None,
     _exit_stack: contextlib.ExitStack | None = None,
 ) -> dict:
     session_tag = session_tag or os.environ.get("AGY_SESSION_TAG") or None
@@ -3079,7 +3160,8 @@ def _ask_agentspace_inner(
         "streamAssistRequest": stream_req,
     }
 
-    timeout_sec = DEFAULT_STREAM_TIMEOUT
+    strict_timeout = timeout_sec is not None
+    eff_timeout_sec = min(3600, max(10, int(timeout_sec))) if timeout_sec is not None else DEFAULT_STREAM_TIMEOUT
     chunks: list | dict = []
     xsrf_path = ""
     stale_recovered = False
@@ -3088,7 +3170,13 @@ def _ask_agentspace_inner(
         chunks = []
         for rpc_try in range(3):
             try:
-                chunks, xsrf_path = _post_widget_rpc("widgetStreamAssist", payload, csesidx=csesidx, timeout=timeout_sec)
+                chunks, xsrf_path = _post_widget_rpc(
+                    "widgetStreamAssist",
+                    payload,
+                    csesidx=csesidx,
+                    timeout=eff_timeout_sec,
+                    strict_timeout=strict_timeout,
+                )
             except urllib.error.HTTPError as he:
                 if he.code == 404 and reused_existing_session and not session and not stale_recovered:
                     chunks = [{"error": {"code": 404, "status": "NOT_FOUND", "message": "Session not found"}}]
@@ -3249,7 +3337,13 @@ def _ask_agentspace_inner(
             "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
             "streamAssistRequest": confirm_req,
         }
-        more_chunks, _ = _post_widget_rpc("widgetStreamAssist", confirm_payload, csesidx=csesidx, timeout=timeout_sec)
+        more_chunks, _ = _post_widget_rpc(
+            "widgetStreamAssist",
+            confirm_payload,
+            csesidx=csesidx,
+            timeout=eff_timeout_sec,
+            strict_timeout=strict_timeout,
+        )
         if isinstance(more_chunks, list):
             for ch in chunks:
                 sar = ch.get("streamAssistResponse", {}) if isinstance(ch, dict) else {}
@@ -3264,6 +3358,7 @@ def _ask_agentspace_inner(
     thoughts = []
     function_calls = []
     stream_errors: list[dict] = []
+    partial_timeout_reason: str | None = None
     final_media_file_ids: list[str] = []
     all_media_file_ids: list[str] = []
     has_immersive_artifact = False
@@ -3271,6 +3366,9 @@ def _ask_agentspace_inner(
 
     if isinstance(chunks, list):
         for chunk in chunks:
+            if isinstance(chunk, dict) and chunk.get("_partial_timeout"):
+                partial_timeout_reason = str(chunk.get("_timeout_reason") or "stream timed out")
+                continue
             if isinstance(chunk, dict) and "error" in chunk:
                 stream_errors.append(chunk["error"])
             sar = chunk.get("streamAssistResponse", {})
@@ -3315,6 +3413,15 @@ def _ask_agentspace_inner(
 
     if stream_errors and not "".join(text_parts).strip():
         raise RuntimeError(f"Agentspace stream error: {json.dumps(stream_errors[-1])}")
+
+    if partial_timeout_reason:
+        short_sid = normalize_session_id(session_name) if session_name else "unknown"
+        timeout_banner = (
+            f"[PARTIAL OUTPUT — TIMED OUT: {partial_timeout_reason}. "
+            f"The server may still finish generating; call `agentspace_get_session` "
+            f"(session_id=`{short_sid}` if available, or `session_tag`) to fetch the full turn.]\n\n"
+        )
+        text_parts.insert(0, timeout_banner)
 
     target_media_ids = final_media_file_ids or all_media_file_ids
     generated_media: list[dict] = []
@@ -3954,9 +4061,11 @@ def main():
             if args.advise:
                 if res.get("need_context"):
                     print(
-                        f"Saved full Advisor plan ({res['line_count']} lines, {res['char_count']} chars) to:\n"
-                        f"  {res['saved_output_path']}\n\n"
-                        f"**[NEED_CONTEXT] DETECTED:**\n{res['need_context'][:4000]}"
+                        "ACTION REQUIRED — DO NOT IMPLEMENT YET ([NEED_CONTEXT] DETECTED)\n"
+                        "The Advisor is blocked and requested additional context. Gather the exact files/command outputs below "
+                        "and re-run with the SAME `--session-tag` before making any edits:\n\n"
+                        f"{res['need_context'][:4000]}\n\n"
+                        f"(Full output saved to: {res['saved_output_path']})"
                     )
                 elif res.get("advisor_spec"):
                     spec_path_str = f"\n  Spec file: {res['advisor_spec_path']}" if res.get("advisor_spec_path") else ""

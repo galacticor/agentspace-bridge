@@ -28,8 +28,8 @@ description: >-
    - Automatically selects `gemini-4-carbon` + `MEDIUM` thinking (override with `--thinking HIGH` / `thinking_level="HIGH"` when needed), attaches a compact repo file tree (`include_tree=True` / `--tree`), injects the **Planner Implementation Manifest** framing, and saves to `advisor_plan.md` with `--summary-only`.
 3. **Maintain Session Continuity (`session_tag`):**
    - Always pass `session_tag` (`<8_char_conv_id>`) so follow-up turns reuse the same `[agy-bridge]` session without re-uploading earlier files.
-4. **Interactive `[NEED_CONTEXT]` Loop:**
-   - If the Advisor responds with `[NEED_CONTEXT]`, gather those exact files/command outputs locally and send them in the next turn with the **same `session_tag`** (cap at 2–3 rounds).
+4. **Mandatory `[NEED_CONTEXT]` Follow-Up Gate (NEVER Ignore):**
+   - If the Advisor responds with `[NEED_CONTEXT]` (or `[NEED CONTEXT]`), **STOP — do NOT guess or start editing**. Gather every requested file/command output locally and call `agentspace_advise` / `--advise` again with the **same `session_tag`** (cap at 2–3 rounds) until the Advisor returns a final `<antigravity_spec>` without `[NEED_CONTEXT]`.
 5. **Execute Locally:**
    - Read the saved `advisor_plan.md` locally and apply the edits + run the verification commands in Antigravity.
 

@@ -22,6 +22,7 @@ from agentspace_cli import (
     delete_session,
     export_session_artifacts,
     finish_task_sessions,
+    get_session_turns,
     list_sessions,
     refresh_xsrf_token,
     DEFAULT_BROWSER_CHANNEL,
@@ -127,6 +128,10 @@ TOOLS = [
                     "default": DEFAULT_MAX_MEDIA_PROMPTS,
                     "description": "Auto-clear/rotate media generation session after N prompts (default: 3).",
                 },
+                "timeout_sec": {
+                    "type": "integer",
+                    "description": "Optional request/stream timeout in seconds (overrides default 600s wall/first-frame guardrail; minimum 10s).",
+                },
             },
             "required": ["prompt"],
         },
@@ -186,6 +191,10 @@ TOOLS = [
                     "type": "string",
                     "default": "advisor_plan.md",
                     "description": "Filename to save the plan under ./outputs/<session_tag>/ (default: 'advisor_plan.md').",
+                },
+                "timeout_sec": {
+                    "type": "integer",
+                    "description": "Optional request/stream timeout in seconds (overrides default 600s wall/first-frame guardrail; minimum 10s).",
                 },
             },
             "required": ["task"],
@@ -266,6 +275,31 @@ TOOLS = [
         },
     },
     {
+        "name": "agentspace_get_session",
+        "description": (
+            "Fetch the latest turn (or all turns) of an IOH Agentspace session via `widgetGetSession` "
+            "at zero LLM re-generation cost. Useful to recover the full server-side response after a stream timeout."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional Agentspace session ID or full resource path (if omitted, uses the latest active session for `session_tag`).",
+                },
+                "session_tag": {
+                    "type": "string",
+                    "description": "Optional Antigravity conversation ID prefix (e.g. 'bba4da86') to resolve the active session.",
+                },
+                "last_turn_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "If true (default), return only the latest turn; set false to return all turns.",
+                },
+            },
+        },
+    },
+    {
         "name": "agentspace_export_slides",
         "description": (
             "Export a Canvas/Slides immersive artifact from an IOH Agentspace session directly into a native `.pptx` "
@@ -311,6 +345,20 @@ TOOLS = [
         },
     },
 ]
+
+
+def _parse_timeout_sec(val) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        raise ValueError("`timeout_sec` must be a positive integer (seconds), not a boolean.")
+    try:
+        parsed = int(val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid `timeout_sec` value: {val!r} (expected integer seconds).") from exc
+    if parsed <= 0:
+        raise ValueError(f"`timeout_sec` must be > 0, got {parsed}.")
+    return parsed
 
 
 def handle_request(msg: dict) -> dict | None:
@@ -363,6 +411,7 @@ def handle_request(msg: dict) -> dict | None:
                     python_pptx=python_pptx,
                     max_media_prompts=int(args.get("max_media_prompts", DEFAULT_MAX_MEDIA_PROMPTS)),
                     csesidx=args.get("csesidx", DEFAULT_CSESIDX),
+                    timeout_sec=_parse_timeout_sec(args.get("timeout_sec")),
                 )
                 if (summary_only or python_pptx) and res.get("saved_output_path"):
                     preview = res["text"][:500]
@@ -417,6 +466,7 @@ def handle_request(msg: dict) -> dict | None:
                     include_tree=bool(args.get("include_tree", True)),
                     advise_mode=True,
                     cwd=args.get("cwd"),
+                    timeout_sec=_parse_timeout_sec(args.get("timeout_sec")),
                 )
                 skipped_note = (
                     f"\n\n**Omitted Files (budget cap):** `{', '.join(res['skipped_files'][:10])}`"
@@ -424,33 +474,37 @@ def handle_request(msg: dict) -> dict | None:
                     else ""
                 )
                 if res.get("need_context"):
-                    body_preview = (
-                        "**[NEED_CONTEXT] DETECTED:** Gather the requested files/outputs below and call "
-                        "`agentspace_advise` again with the same `session_tag`:\n\n"
-                        f"{res['need_context'][:4000]}"
+                    out_text = (
+                        "## ACTION REQUIRED — DO NOT IMPLEMENT YET (`[NEED_CONTEXT]` DETECTED)\n"
+                        "The Advisor is blocked and needs more context before finalizing the plan. **Do NOT guess or start editing.**\n"
+                        "1. Gather the exact files or command outputs requested below.\n"
+                        "2. Call `agentspace_advise` again with the **same `session_tag`** passing those `files` (or paste command output in `task`).\n\n"
+                        f"{res['need_context'][:4000]}\n\n"
+                        f"_(Saved full Advisor response to `{res.get('saved_output_path', '')}`.{skipped_note})_"
                     )
-                elif res.get("advisor_spec"):
-                    spec_txt = res["advisor_spec"]
-                    if len(spec_txt) <= 4000:
-                        body_preview = (
-                            f"**Extracted `<antigravity_spec>`** (also saved to `{res.get('advisor_spec_path', '')}` — "
-                            f"apply directly without reading full `advisor_plan.md`):\n\n{spec_txt}"
-                        )
-                    else:
-                        body_preview = (
-                            f"**Spec exceeds inline cap ({len(spec_txt)} chars).** Read ONLY `{res.get('advisor_spec_path', '')}` "
-                            f"(skip full narrative `advisor_plan.md`).\n\n{spec_txt[:1500]}\n... [truncated]"
-                        )
                 else:
-                    preview = res["text"][:800]
-                    if len(res["text"]) > 800:
-                        preview += "\n... [truncated; no <antigravity_spec> tag found — read saved plan]"
-                    body_preview = f"**Preview:**\n{preview}"
+                    if res.get("advisor_spec"):
+                        spec_txt = res["advisor_spec"]
+                        if len(spec_txt) <= 4000:
+                            body_preview = (
+                                f"**Extracted `<antigravity_spec>`** (also saved to `{res.get('advisor_spec_path', '')}` — "
+                                f"apply directly without reading full `advisor_plan.md`):\n\n{spec_txt}"
+                            )
+                        else:
+                            body_preview = (
+                                f"**Spec exceeds inline cap ({len(spec_txt)} chars).** Read ONLY `{res.get('advisor_spec_path', '')}` "
+                                f"(skip full narrative `advisor_plan.md`).\n\n{spec_txt[:1500]}\n... [truncated]"
+                            )
+                    else:
+                        preview = res["text"][:800]
+                        if len(res["text"]) > 800:
+                            preview += "\n... [truncated; no <antigravity_spec> tag found — read saved plan]"
+                        body_preview = f"**Preview:**\n{preview}"
 
-                out_text = (
-                    f"Saved full Advisor rationale ({res['line_count']} lines, {res['char_count']} chars) to "
-                    f"`{res.get('saved_output_path', '')}`.{skipped_note}\n\n{body_preview}"
-                )
+                    out_text = (
+                        f"Saved full Advisor rationale ({res['line_count']} lines, {res['char_count']} chars) to "
+                        f"`{res.get('saved_output_path', '')}`.{skipped_note}\n\n{body_preview}"
+                    )
                 if res.get("session"):
                     out_text += f"\n\n---\n_Agentspace Session: `{res['session']}` (Target: `{res['model']}`)_"
                 return {
@@ -546,6 +600,31 @@ def handle_request(msg: dict) -> dict | None:
                     },
                 }
 
+            elif name == "agentspace_get_session":
+                sess_res = get_session_turns(
+                    session_id=args.get("session_id"),
+                    session_tag=args.get("session_tag"),
+                    last_turn_only=bool(args.get("last_turn_only", True)),
+                    csesidx=args.get("csesidx", DEFAULT_CSESIDX),
+                )
+                if bool(args.get("last_turn_only", True)):
+                    turn_state = sess_res["turns"][-1]["state"] if sess_res["turns"] else "EMPTY"
+                    out_text = (
+                        f"**Session:** `{sess_res['session_id']}` ({sess_res['display_name']}) | "
+                        f"**Turns:** {sess_res['turns_count']} | **Latest State:** `{turn_state}`\n\n"
+                        f"{sess_res['latest_text'] or '_No answer text persisted yet._'}"
+                    )
+                else:
+                    out_text = json.dumps(sess_res, indent=2)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": out_text}],
+                        "isError": False,
+                    },
+                }
+
             elif name == "agentspace_refresh_token":
                 data, saved_path = refresh_xsrf_token(
                     browser_channel=args.get("browser", DEFAULT_BROWSER_CHANNEL),
@@ -574,6 +653,15 @@ def handle_request(msg: dict) -> dict | None:
                     "error": {"code": -32601, "message": f"Unknown tool: {name}"},
                 }
 
+        except ValueError as ve:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": f"Invalid argument: {ve}"}],
+                    "isError": True,
+                },
+            }
         except Exception as e:
             return {
                 "jsonrpc": "2.0",

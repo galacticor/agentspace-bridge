@@ -2637,7 +2637,9 @@ def _expand_input_paths_with_report(
     """
     import glob as _glob
 
-    base_dir = os.path.abspath(cwd or os.getcwd())
+    base_dir = os.path.abspath(
+        os.path.expandvars(os.path.expanduser(cwd)) if cwd else os.getcwd()
+    )
     collected: list[str] = []
     seen: set[str] = set()
     skipped: list[str] = []
@@ -2665,9 +2667,25 @@ def _expand_input_paths_with_report(
         seen.add(ap)
         collected.append(ap)
 
+    expanded_inputs: list[str] = []
     for raw in paths:
-        candidate = raw if os.path.isabs(raw) else os.path.join(base_dir, raw)
-        if any(ch in raw for ch in ("*", "?", "[")):
+        if not raw:
+            continue
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        expanded_raw = os.path.expandvars(os.path.expanduser(cleaned))
+        literal_cand = expanded_raw if os.path.isabs(expanded_raw) else os.path.join(base_dir, expanded_raw)
+        if "," in cleaned and not any(ch in cleaned for ch in ("*", "?", "[")) and not os.path.exists(literal_cand):
+            parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+            expanded_inputs.extend(parts)
+        else:
+            expanded_inputs.append(cleaned)
+
+    for raw in expanded_inputs:
+        expanded_raw = os.path.expandvars(os.path.expanduser(raw))
+        candidate = expanded_raw if os.path.isabs(expanded_raw) else os.path.join(base_dir, expanded_raw)
+        if any(ch in expanded_raw for ch in ("*", "?", "[")):
             for m in sorted(_glob.glob(candidate, recursive=True)):
                 if os.path.isfile(m):
                     rel_parts = os.path.relpath(os.path.abspath(m), base_dir).split(os.sep)
@@ -2716,7 +2734,9 @@ def _expand_input_paths(
 
 def _build_repo_tree(cwd: str | None = None, max_entries: int = 200) -> str:
     """Build a compact file list of the workspace for Advisor context."""
-    base_dir = os.path.abspath(cwd or os.getcwd())
+    base_dir = os.path.abspath(
+        os.path.expandvars(os.path.expanduser(cwd)) if cwd else os.getcwd()
+    )
     entries: list[str] = []
     try:
         proc = subprocess.run(
@@ -3517,7 +3537,13 @@ def main():
         action="append",
         default=[],
         metavar="FILE_PATH",
-        help="Attach a local file, directory, or glob pattern directly from disk into the prompt (can be specified multiple times)",
+        help="Attach a local file, directory, or glob pattern directly from disk into the prompt (can be specified multiple times or comma-separated)",
+    )
+    parser.add_argument(
+        "--cwd",
+        default=None,
+        metavar="DIR",
+        help="Working directory used to resolve relative -f paths and --tree (defaults to current directory)",
     )
     parser.add_argument(
         "--advise",
@@ -3920,6 +3946,7 @@ def main():
             csesidx=args.csesidx,
             include_tree=bool(args.tree or args.advise),
             advise_mode=bool(args.advise),
+            cwd=args.cwd,
         )
         if args.json:
             print(json.dumps(res, indent=2))

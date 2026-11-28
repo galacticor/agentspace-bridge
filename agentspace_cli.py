@@ -1212,6 +1212,26 @@ def update_session_context_file_id(
         _atomic_write_json(state_path, state)
 
 
+def _create_widget_session(
+    csesidx: str = DEFAULT_CSESIDX,
+    timeout: int = 30,
+) -> str:
+    """Create a real Agentspace session via widgetCreateSession and return its resource name."""
+    payload = {
+        "configId": WIDGET_CONFIG_ID,
+        "additionalParams": {"token": "-"},
+        "createSessionRequest": {},
+    }
+    resp, _ = _post_widget_rpc("widgetCreateSession", payload, csesidx=csesidx, timeout=timeout)
+    if not isinstance(resp, dict):
+        raise RuntimeError(f"Unexpected widgetCreateSession response: {resp!r}")
+    sess_obj = resp.get("session")
+    sess_name = sess_obj.get("name") if isinstance(sess_obj, dict) else None
+    if not sess_name:
+        raise RuntimeError(f"widgetCreateSession missing session.name: {resp!r}")
+    return str(sess_name)
+
+
 def _upload_context_bundle(
     sess_name: str,
     bundle_bytes: bytes,
@@ -2731,7 +2751,8 @@ def _expand_input_paths_with_report(
 
     def _add_file(p: str) -> None:
         ap = os.path.abspath(p)
-        if ap in seen or not os.path.isfile(ap):
+        norm_ap = os.path.normcase(ap)
+        if norm_ap in seen or not os.path.isfile(ap):
             return
         fn = os.path.basename(ap)
         display = _get_display(ap)
@@ -2742,7 +2763,7 @@ def _expand_input_paths_with_report(
         if ext in _ADVISOR_BINARY_EXTS:
             skipped.append(f"{display} (binary file omitted)")
             return
-        seen.add(ap)
+        seen.add(norm_ap)
         collected.append(ap)
 
     expanded_inputs: list[str] = []
@@ -2766,7 +2787,10 @@ def _expand_input_paths_with_report(
         if any(ch in expanded_raw for ch in ("*", "?", "[")):
             for m in sorted(_glob.glob(candidate, recursive=True)):
                 if os.path.isfile(m):
-                    rel_parts = os.path.relpath(os.path.abspath(m), base_dir).split(os.sep)
+                    try:
+                        rel_parts = os.path.relpath(os.path.abspath(m), base_dir).split(os.sep)
+                    except ValueError:
+                        rel_parts = os.path.abspath(m).split(os.sep)
                     if any(pt in _ADVISOR_IGNORED_DIRS for pt in rel_parts[:-1]):
                         continue
                     _add_file(m)
@@ -3054,7 +3078,7 @@ def _ask_agentspace_inner(
                 c_blocks.append(omitted_block)
                 raw_c_blocks.append(omitted_block)
 
-        nonlocal pending_file_id
+        nonlocal pending_file_id, effective_session
         context_file_ids: list[str] = []
         if c_blocks:
             bundle_text = "\n\n".join(c_blocks)
@@ -3072,21 +3096,51 @@ def _ask_agentspace_inner(
             elif len(bundle_bytes) <= CONTEXT_INLINE_MAX_BYTES:
                 f_prompt = f"{f_prompt}\n\n{bundle_text}"
             else:
-                sess_for_upload = effective_session or format_delete_session_name("-")
-                file_id, _ = _upload_context_bundle(
-                    sess_for_upload,
-                    bundle_bytes,
-                    raw_bundle_hash,
-                    csesidx=csesidx,
-                )
+                created_here = False
+                if not effective_session:
+                    effective_session = _create_widget_session(csesidx=csesidx)
+                    created_here = True
+                try:
+                    file_id, _ = _upload_context_bundle(
+                        effective_session,
+                        bundle_bytes,
+                        raw_bundle_hash,
+                        csesidx=csesidx,
+                    )
+                except Exception:
+                    if created_here and effective_session:
+                        try:
+                            delete_session(effective_session, csesidx=csesidx)
+                        except Exception:
+                            pass
+                        effective_session = None
+                    raise
                 pending_file_id = (raw_bundle_hash, file_id)
                 context_file_ids.append(file_id)
         return f_prompt, att_files, sk_files, context_file_ids
 
     pending_file_id: tuple[str, str] | None = None
-    full_prompt, attached_files, skipped_files, context_file_ids = _build_full_prompt(
-        is_reused=reused_existing_session
-    )
+    try:
+        full_prompt, attached_files, skipped_files, context_file_ids = _build_full_prompt(
+            is_reused=reused_existing_session
+        )
+    except urllib.error.HTTPError as he:
+        if he.code == 404 and reused_existing_session and not session:
+            print(
+                f"[Agentspace Session] Stale session {normalize_session_id(effective_session)} not found (404) during context upload; clearing cache and retrying in fresh session...",
+                file=sys.stderr,
+            )
+            clear_reusable_session(effective_state_tag, mode_key, deleted_session_id=effective_session)
+            effective_session = None
+            reused_existing_session = False
+            prior_hashes = {}
+            pending_hashes = {}
+            pending_file_id = None
+            full_prompt, attached_files, skipped_files, context_file_ids = _build_full_prompt(
+                is_reused=False
+            )
+        else:
+            raise
 
     stream_req: dict = {
         "query": {"parts": [{"text": full_prompt}]},
@@ -3235,8 +3289,11 @@ def _ask_agentspace_inner(
             stream_req.pop("session", None)
             prior_hashes = {}
             pending_hashes = {}
+            pending_file_id = None
             full_prompt, attached_files, skipped_files, context_file_ids = _build_full_prompt(is_reused=False)
             stream_req["query"] = {"parts": [{"text": full_prompt}]}
+            if effective_session:
+                stream_req["session"] = effective_session
             if context_file_ids:
                 stream_req["fileIds"] = context_file_ids
             else:
